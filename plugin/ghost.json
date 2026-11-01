@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 3,
+  "id": "trae-bridge",
+  "name": "Trae 桥",
+  "version": "0.1.4",
+  "releaseNotes": "修好「trae 侧显示未登录、消息发不出去」：本机同时存在 Trae CN 与 TRAE SOLO 两份 storage.json，之前按目录名取第一份，可能拿到早已过期的旧 token，一路 401。现在遍历全部候选，优先取「未过期且最后登录」的那份。同时修面板的登录判定：凭据没有过期时间时不再误判成未登录。",
+  "minCindyVersion": "0.1.119",
+  "author": "linvis",
+  "description": "读取本机 Trae CN 客户端的登录状态，在本机起一个 OpenAI / Anthropic 兼容接口，供 Cindy 的「自定义供应商」指向。不修改 Cindy 任何文件，也不会替你填供应商配置。",
+  "whenToUse": "用户想在 Cindy 里用 Trae 的模型时；用户问 Trae 桥的地址、状态、模型数或额度积分时；用户说 Trae 登录过期、要重新登录时；用户说要 Trae 每日签到领积分时。",
+  "entry": "main.js",
+  "launch": "resident",
+  "command": "trae",
+  "node": {
+    "entry": "node/worker.cjs",
+    "protocol": "json-rpc-stdio",
+    "lifecycle": "resident"
+  },
+  "tools": [
+    {
+      "name": "trae_status",
+      "description": "查询 Trae 桥的运行状态：是否读到 Trae CN 的登录凭据、登录账号与区域、监听端口、可用模型数量、额度/积分快照、今日签到情况、本地用量与日志文件路径。返回一段可直接念给用户看的状态文本。用户问「Trae 能不能用」「还剩多少额度积分」「签到没有」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trae_endpoint",
+      "description": "返回在 Cindy 里配置自定义供应商所需的全部信息：Base URL（形如 http://127.0.0.1:47822/v1）、API Key（Token）以及模型 ID 的填写提示。用户问「怎么在 Cindy 里加 Trae」「地址和密钥是什么」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trae_refresh",
+      "description": "强制重新读取 Trae CN 登录凭据并刷新模型目录，返回刷新后的完整状态（同 trae_status）。用户说「登录不上」「模型没更新」「刚在 Trae 里重新登录了」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trae_checkin",
+      "description": "领取 Trae 每日签到积分。返回是否领取成功（claimed）、结果码、给用户看的消息，以及签到后的最新状态。用户说「签到」「领今天的积分」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ],
+  "panel": {
+    "title": "Trae 桥",
+    "html": "panel.html",
+    "position": "right"
+  }
+}

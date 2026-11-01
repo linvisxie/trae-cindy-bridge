@@ -1,0 +1,14 @@
+Trae 桥（Cindy 插件）
+
+Copyright (c) 2026 linvis
+
+本项目以 MIT 许可发布，全文见 LICENSE。
+
+本项目是从作者自己的 cindy-qoder-bridge（MIT）整体复制骨架后改造而来。
+协议研究参照 dingminhua/dsh-connect-trae（MIT，Copyright (c) 2026 LaoDing）
+与 Wang-JQ77/dsh-trae-api（MIT）。
+它们的版权声明与许可全文见 THIRD-PARTY-NOTICES.md，分发时必须一并保留。
+
+本插件为非官方项目，与 Trae、字节跳动无隶属关系，未获其授权或认可。
+它冒充 Trae IDE 的身份去请求 Trae 自己的网关，属于逆向实现，
+使用它可能违反 Trae 的用户协议，风险由使用者自行承担。

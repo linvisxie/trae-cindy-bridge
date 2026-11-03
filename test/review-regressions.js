@@ -189,3 +189,120 @@ if (IS_TRAE) {
     assert.equal(calls, 1); assert.equal(w.run('credential.token'), 'new');
   });
 }
+
+// ---------- 错误状态只写不清（2026-11-04 线上看到的那条红字） ----------
+// 现象：worker 启动时后台补额度失败一次，之后即使刷新成功，「额度读取失败：fetch failed」
+// 仍永久挂在面板和状态文本上。原因是 lastError 只有赋值、从没清空。
+// 这里钉住的是：成功刷新必须按来源清掉自己的失败，且不同来源互不误清。
+{
+  const usageFail = () => { throw new Error('fetch failed'); };
+  const usageOk = () => ({ total: 2700, used: 74.33, remaining: 2625.67, unit: 'credits' });
+
+  test('a later successful usage refresh clears the earlier usage error', async () => {
+    let mode = 'fail';
+    const w = worker({ trae: {
+      readTraeCredential: () => ({ ok: true, credential: { token: 'A', refreshToken: 'RA', expiresAtMs: Date.now() + 3600000 }, identity: {} }),
+      refreshUsage: () => (mode === 'fail' ? usageFail() : usageOk()),
+      refreshCheckin: async () => ({ enabled: true, checkedIn: false }),
+      fetchModels: async () => ({ models: [{ key: 'm', name: 'M' }] }),
+    } });
+    await w.run('refreshCredential(true)');
+
+    await w.run("refreshUsage(true)");                       // 第一次失败
+    assert.match(w.run('lastErrorText()'), /额度读取失败/);   // 有错误
+
+    mode = 'ok';
+    await w.run("refreshUsage(true)");                       // 第二次成功
+    assert.equal(w.run('lastErrorText()'), '');              // 错误必须被清掉
+    assert.equal((await w.run('buildStatus()')).lastError, '');
+  });
+
+  test('a successful model refresh does not clear a usage error, and vice versa', async () => {
+    const w = worker({ trae: {
+      readTraeCredential: () => ({ ok: true, credential: { token: 'A', refreshToken: 'RA', expiresAtMs: Date.now() + 3600000 }, identity: {} }),
+      refreshUsage: () => usageFail(),
+      refreshCheckin: async () => ({ enabled: true, checkedIn: false }),
+      fetchModels: async () => ({ models: [{ key: 'm', name: 'M' }] }),
+    } });
+    await w.run('refreshCredential(true)');
+    await w.run("refreshUsage(true)");
+    await w.run("refreshModels(true)");                      // 模型成功，不该清掉额度错误
+    assert.match(w.run('lastErrorText()'), /额度读取失败/);
+    assert.equal(w.run('errors.usage') !== null, true);
+    assert.equal(Boolean(w.run('errors.models')), false);
+  });
+
+  test('the error text says how long ago it happened', async () => {
+    const w = worker({ trae: {} });
+    w.run("setError('usage','额度读取失败：fetch failed')");
+    assert.match(w.run('lastErrorText()'), /秒前/);
+    w.run("errors.usage.at = Date.now() - 5 * 60 * 1000");
+    assert.match(w.run('lastErrorText()'), /5 分钟前/);
+    w.run("errors.usage.at = Date.now() - 3 * 3600 * 1000");
+    assert.match(w.run('lastErrorText()'), /3 小时前/);
+  });
+
+  test('stale quota is flagged so an old number cannot pass for the current one', async () => {
+    let mode = 'ok';
+    const w = worker({ trae: {
+      readTraeCredential: () => ({ ok: true, credential: { token: 'A', refreshToken: 'RA', expiresAtMs: Date.now() + 3600000 }, identity: {} }),
+      refreshUsage: () => (mode === 'ok' ? usageOk() : usageFail()),
+      refreshCheckin: async () => ({ enabled: true, checkedIn: false }),
+      fetchModels: async () => ({ models: [{ key: 'm', name: 'M' }] }),
+    } });
+    await w.run('refreshCredential(true)');
+    await w.run("refreshUsage(true)");
+    assert.equal((await w.run('buildStatus()')).quotaStale, false);
+    mode = 'fail';
+    await w.run("refreshUsage(true)");
+    assert.equal((await w.run('buildStatus()')).quotaStale, true);   // 旧值必须被标出来
+  });
+}
+
+// ---------- 缓存与推理明细被写死成 0（2026-11-04 面板命中率恒为 0%） ----------
+// 现象：Cindy 里缓存读/写恒 0、命中率 0%，看着像上游没缓存。实际是适配层把
+// prompt_tokens_details.cached_tokens 和 completion_tokens_details.reasoning_tokens
+// 写死了，上游真值被丢掉。实测上游给的是 cached=1792 / prompt=2034。
+{
+  const adapters = require('../plugin/node/adapters.cjs');
+  const UPSTREAM = {
+    prompt_tokens: 2034, completion_tokens: 11,
+    prompt_tokens_details: { cached_tokens: 1792 },
+    completion_tokens_details: { reasoning_tokens: 9 },
+  };
+
+  test('responses usage passes upstream cached and reasoning tokens through', () => {
+    const u = adapters.responsesUsage(UPSTREAM, 0);
+    assert.equal(u.input_tokens, 2034);
+    assert.equal(u.input_tokens_details.cached_tokens, 1792);
+    assert.equal(u.output_tokens_details.reasoning_tokens, 9);
+    assert.equal(u.total_tokens, 2045);
+  });
+
+  test('anthropic usage reports cache_read_input_tokens so the hit rate is not 0', () => {
+    const u = adapters.anthropicUsage(UPSTREAM, 0);
+    assert.equal(u.input_tokens, 2034);
+    assert.equal(u.output_tokens, 11);
+    assert.equal(u.cache_read_input_tokens, 1792);
+  });
+
+  test('missing cache detail falls back to 0 instead of undefined', () => {
+    const bare = { prompt_tokens: 100, completion_tokens: 5 };
+    assert.equal(adapters.responsesUsage(bare, 0).input_tokens_details.cached_tokens, 0);
+    assert.equal(adapters.responsesUsage(bare, 0).output_tokens_details.reasoning_tokens, 0);
+    const a = adapters.anthropicUsage(bare, 0);
+    assert.equal(a.cache_read_input_tokens, undefined);  // 没有命中就不编一个 0 出来
+    assert.deepEqual(adapters.census(null), { cached: 0, reasoning: 0 });
+  });
+
+  test('a real zero cache hit stays zero and is not treated as missing', () => {
+    const noHit = {
+      prompt_tokens: 50, completion_tokens: 3,
+      prompt_tokens_details: { cached_tokens: 0 },
+      completion_tokens_details: { reasoning_tokens: 0 },
+    };
+    assert.equal(adapters.responsesUsage(noHit, 0).input_tokens_details.cached_tokens, 0);
+    // 缓存真为 0 时 Anthropic 侧不报该字段（报 0 与「不支持缓存」在语义上要能区分）
+    assert.equal(adapters.anthropicUsage(noHit, 0).cache_read_input_tokens, undefined);
+  });
+}

@@ -39,7 +39,26 @@ let modelsAt = 0;
 let server;
 let actualPort = 0;
 let token = '';
-let lastError = '';
+// 错误状态按来源分开存：模型目录挂了不该被一次成功的额度刷新清掉，反之亦然。
+// 每项形如 { msg, at }，at 是失败发生的时刻——面板要能显示「多久以前」，
+// 否则一条启动瞬间的瞬时抖动会一直挂着，看着像现在坏了。
+const errors = { models: null, usage: null, checkin: null };
+function setError(source, msg) {
+  if (msg) errors[source] = { msg, at: Date.now() };
+  else if (source) delete errors[source];
+  else for (const k of Object.keys(errors)) errors[k] = null;
+}
+// 对外一个字符串：取最新那条，并标出多久以前失败的。
+function lastErrorText(now = Date.now()) {
+  const live = Object.entries(errors).filter(([, v]) => v && v.msg);
+  if (!live.length) return '';
+  live.sort((a, b) => b[1].at - a[1].at);
+  const [source, v] = live[0];
+  const ago = Math.max(0, Math.round((now - v.at) / 1000));
+  const when = ago < 60 ? `${ago} 秒前` : ago < 3600 ? `${Math.round(ago / 60)} 分钟前` : `${Math.round(ago / 3600)} 小时前`;
+  const tag = source === 'usage' ? '额度' : source === 'checkin' ? '签到' : '模型目录';
+  return `（${when}）${v.msg}${tag === '额度' ? '——额度数字可能不是最新的' : ''}`;
+}
 let lastQuota;
 let bootedAt = 0;
 let lastCheckin;
@@ -219,12 +238,13 @@ async function refreshModels(force) {
       log('部分 function 目录拉取失败', JSON.stringify(r.failures).slice(0, 300));
     }
     try { mkdirSync(DATA_DIR, { recursive: true }); writeFileSync(cache, JSON.stringify(models, null, 1)); } catch {}
+    setError('models', null);  // 这次拉到了，上一次的失败就不该再挂着
     return models;
   } catch (e) {
     // 有些版本的 Trae 目录接口会临时缺口（服务端没发 function config），
     // 这时候既不该让人重登录，也不该把模型列表清空——先退回磁盘缓存。
-    lastError = `模型目录刷新失败：${e.message}`;
-    log(lastError);
+    setError('models', `模型目录刷新失败：${e.message}`);
+    log(`模型目录刷新失败：${e.message}`);
     if (!models.length) {
       try { models = JSON.parse(readFileSync(cache, 'utf8')); } catch {}
     }
@@ -243,6 +263,7 @@ async function refreshUsage(force) {
   const cred = await refreshCredential(false);
   if (!cred) {
     const why = '读不到 Trae 登录态，无法查额度';
+    setError('usage', why);
     lastUsage = { ...(lastUsage || {}), at: Date.now(), error: why };
     if (lastQuota) lastQuota = { ...lastQuota, stale: true, staleReason: why };
     return lastUsage;
@@ -262,10 +283,11 @@ async function refreshUsage(force) {
       }
       : { total: 0, used: 0, remaining: 0, note: '这个账号没有 Work Credit 配额（可能是免费版）' };
     lastQuota = q;
+    setError('usage', null);  // 这次读到了，上一次的失败就不该再挂着
     return lastUsage;
   } catch (e) {
     const why = `额度读取失败：${e.message}`;
-    lastError = why;
+    setError('usage', why);
     log(why);
     lastUsage = { ...(lastUsage || {}), at: Date.now(), error: why };
     if (lastQuota) lastQuota = { ...lastQuota, stale: true, staleReason: why };
@@ -293,9 +315,11 @@ async function refreshCheckin(force) {
       ...(s.extraCredits ? { extraCredits: s.extraCredits } : {}),
       ...(identity && identity.deviceId ? {} : { note: '没读到 device-id，签到可能领不了（上游要它）' }),
     };
+    setError('checkin', null);
     return lastCheckin;
   } catch (e) {
     lastCheckin = { at: Date.now(), active: false, error: e.message };
+    setError('checkin', `签到状态读取失败：${e.message}`);
     return lastCheckin;
   }
 }
@@ -1157,7 +1181,9 @@ async function buildStatus() {
     logFile: LOG_FILE,
     sourcePath: identity && identity.storagePath ? identity.storagePath : undefined,
     uptimeSeconds: Math.floor((Date.now() - bootedAt) / 1000),
-    lastError,
+    // 只报还活着的错误（成功刷新会按来源清掉），并带上「多久以前」。
+    lastError: lastErrorText(),
+    quotaStale: Boolean(lastQuota && lastQuota.stale),
     ...(cred ? {} : { hint: notSignedInMessage() }),
   };
 }

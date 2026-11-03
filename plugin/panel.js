@@ -136,7 +136,8 @@
     $('region').textContent = st.region ? String(st.region).toUpperCase() : '—';
     $('port').textContent = st.port || '—';
     $('modelCount').textContent = (st.modelCount || 0) + ' 个';
-    $('quota').textContent = quotaText(st.quota);
+    // 额度是旧值时明确标出来，别让「上一次的数字」冒充「现在的数字」。
+    $('quota').textContent = quotaText(st.quota) + (st.quota && st.quota.stale ? '（旧值）' : '');
     renderCheckin(st.checkin);
     $('uptime').textContent = st.ok === false ? '服务未起' : fmtDuration(st.uptimeSeconds);
     $('logFile').textContent = st.logFile || '—';

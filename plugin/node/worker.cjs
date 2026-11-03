@@ -9,9 +9,11 @@
 
 const http = require('node:http');
 const os = require('node:os');
+const zlib = require('node:zlib');
 const crypto = require('node:crypto');
+const { spawn } = require('node:child_process');
 const { join } = require('node:path');
-const { readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync } = require('node:fs');
+const { readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync, existsSync } = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const adapters = require('./adapters.cjs');
 const trae = require('./trae.cjs');
@@ -97,7 +99,63 @@ async function refreshCredential(force) {
     log('credential read failed', e.message);
     if (force) { credential = undefined; identity = undefined; }
   }
+  // 读到凭据但已经过期（或 5 分钟内到期）就顺手续一次：
+  // 用户的 Trae 客户端可能十几天没开，storage.json 里那张票早死了，
+  // 不续的话每次对话都要等一次 401 才知道。
+  if (credential && credential.refreshToken) {
+    const exp = Number(credential.expiresAtMs) || 0;
+    if (!exp || exp - Date.now() < 5 * 60 * 1000) await renewCredential('凭据快到期');
+  }
   return credential;
+}
+
+// 同一次续期只跑一份：并发进来的几个对话请求不应该各自去换票（浪费且会互相顶掉 refreshToken）。
+let renewing = null;
+
+/**
+ * 用 refreshToken 换一张新的 access token。
+ *
+ * 换到的票只放内存，**不写回 storage.json** —— 那个文件 Trae 客户端自己也在写，
+ * 从外面改会被它下一次 flush 覆盖，属于给自己埋雷。
+ * 返回 true 表示内存里的 credential 已经是新的。
+ */
+async function renewCredential(reason) {
+  if (!credential || !credential.refreshToken) return false;
+  if (renewing) return renewing;
+  renewing = (async () => {
+    try {
+      const out = await trae.refreshAccessToken(credential, identity);
+      credential = {
+        ...credential,
+        token: out.token,
+        expiresAtMs: out.expiresAtMs,
+        refreshToken: out.refreshToken || credential.refreshToken,
+        refreshExpiresAtMs: out.refreshExpiresAtMs || credential.refreshExpiresAtMs,
+      };
+      credentialAt = Date.now();
+      log(`token 已续期（${reason || '主动'}）`, `新到期 ${new Date(out.expiresAtMs).toISOString()}`);
+      return true;
+    } catch (e) {
+      log('token 续期失败', String(e && e.message ? e.message : e).slice(0, 300));
+      return false;
+    }
+  })();
+  try {
+    return await renewing;
+  } finally {
+    renewing = null;
+  }
+}
+
+// 401/403 或 Trae 的 1001（not able to authenticate you）都算「票过期了，能续一次」。
+// 注意不能只看 status：Trae 把鉴权失败塞在 HTTP 200 的 SSE 里，trae.cjs 翻出来时
+// 会带上 upstreamCode=1001 而 status 是 401 —— 两个都认。
+function isAuthError(e) {
+  const status = Number(e && e.status);
+  const code = String((e && e.upstreamCode) || '');
+  if (status === 401 || status === 403) return true;
+  if (code === '1001') return true;
+  return /not able to authenticate|1001/.test(String((e && e.message) || ''));
 }
 
 // trae.cjs 给的模型形状 {id,name,channel,contextWindow,maxTokens,reasoning,creditMultiplier}
@@ -365,6 +423,38 @@ function queueWaitMs(err) {
   if (status !== 429 && code !== '4011') return undefined;
   const s = Number(err?.retryAfterSeconds);
   return (Number.isFinite(s) && s > 0 ? Math.min(s, 120) : 30) * 1000;
+}
+
+/**
+ * 起一个上游流：拿到第一个 chunk 才算成功。
+ *
+ * 两种重试叠在一起，顺序不能反：
+ *   1) 鉴权失败（401/403/1001）→ 续一次票再来（只续一次，续完还是 401 就是真没权限，
+ *      继续续只会刷爆上游；用户十几天没开 Trae 时这条是常态）；
+ *   2) 限流（429/4011）→ 按 retryAfterSeconds 等，最多 3 次。
+ */
+async function openUpstreamStream(cred, request, signal, displayModel) {
+  let renewed = false;
+  let attempt = 0;
+  let current = cred;
+  for (;;) {
+    try {
+      const iterator = streamChat(current, request, signal);
+      const first = await iterator.next();
+      return { iterator, first };
+    } catch (e) {
+      if (!renewed && isAuthError(e)) {
+        renewed = true;
+        log('对话鉴权失败，续期后重试', displayModel);
+        if (await renewCredential('对话鉴权失败')) { current = credential; attempt = 0; continue; }
+      }
+      attempt += 1;
+      const wait = queueWaitMs(e);
+      if (wait === undefined || attempt >= 3) throw e;
+      log(`排队等待 ${wait}ms（第 ${attempt} 次）`, displayModel);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
 }
 
 // 把 Trae 的错误码翻成人话。Trae 的失败基本都藏在 HTTP 200 的 SSE 里，
@@ -711,20 +801,7 @@ async function chatCompletions(req, res) {
 
   let iterator, first;
   try {
-    let attempt = 0;
-    for (;;) {
-      try {
-        iterator = streamChat(cred, request, controller.signal);
-        first = await iterator.next();
-        break;
-      } catch (e) {
-        attempt += 1;
-        const wait = queueWaitMs(e);
-        if (wait === undefined || attempt >= 3) throw e;
-        log(`排队等待 ${wait}ms（第 ${attempt} 次）`, displayModel);
-        await new Promise((r) => setTimeout(r, wait));
-      }
-    }
+    ({ iterator, first } = await openUpstreamStream(cred, request, controller.signal, displayModel));
   } catch (e) {
     cancelOnClose.done();
     log('对话失败', displayModel, e.message.slice(0, 200));
@@ -826,20 +903,7 @@ async function openUpstream(req, res, request, displayModel) {
 
   let iterator, first;
   try {
-    let attempt = 0;
-    for (;;) {
-      try {
-        iterator = streamChat(cred, request, controller.signal);
-        first = await iterator.next();
-        break;
-      } catch (e) {
-        attempt += 1;
-        const wait = queueWaitMs(e);
-        if (wait === undefined || attempt >= 3) throw e;
-        log(`排队等待 ${wait}ms（第 ${attempt} 次）`, displayModel);
-        await new Promise((r) => setTimeout(r, wait));
-      }
-    }
+    ({ iterator, first } = await openUpstreamStream(cred, request, controller.signal, displayModel));
   } catch (e) {
     cancelOnClose.done();
     log('对话失败', displayModel, e.message.slice(0, 200));
@@ -1082,6 +1146,221 @@ async function buildStatus() {
 }
 
 // ============================================================
+// 自查更新（GitHub Releases）
+// ============================================================
+//
+// 为什么走 GitHub API 而不是 gh CLI：gh 要登录态、要看代理配没配对，
+// 而 release 的 REST 接口匿名就能读（公开仓库），node 自带 fetch 直接打就行。
+// 这里只做「检查 + 下载 + 交给一个独立脚本去替换」，不在本进程里改自己的文件 ——
+// Windows 上正在运行的文件会被锁，硬覆盖一定失败。
+
+const UPDATE_REPO = process.env.TRAE_BRIDGE_REPO || 'linvisxie/trae-cindy-bridge';
+const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
+const UPDATE_DIR = join(DATA_DIR, 'update');
+const INSTALL_DIR = join(__dirname, '..');
+
+function versionParts(v) {
+  return String(v || '').replace(/^v/i, '').split('.').map((x) => Number(x.replace(/\D/g, '')) || 0);
+}
+
+// 比版本：a 比 b 新返回正数，相同 0，旧负数。逐段比，缺的段按 0 算。
+function compareVersion(a, b) {
+  const x = versionParts(a);
+  const y = versionParts(b);
+  const n = Math.max(x.length, y.length);
+  for (let i = 0; i < n; i++) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+function currentVersion() {
+  try {
+    return String(JSON.parse(readFileSync(join(INSTALL_DIR, 'ghost.json'), 'utf8')).version || '');
+  } catch {
+    return '';
+  }
+}
+
+async function checkUpdate() {
+  const mine = currentVersion();
+  const res = await fetch(UPDATE_API, {
+    headers: { 'User-Agent': 'trae-bridge', Accept: 'application/vnd.github+json' },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(`查更新失败：GitHub 返回 HTTP ${res.status}`);
+  const j = await res.json();
+  const latest = String(j.tag_name || '').replace(/^v/i, '');
+  const asset = (Array.isArray(j.assets) ? j.assets : []).find((a) => typeof a.name === 'string' && a.name.endsWith('.cindy'));
+  return {
+    current: mine,
+    latest,
+    hasUpdate: Boolean(latest) && compareVersion(latest, mine) > 0,
+    htmlUrl: typeof j.html_url === 'string' ? j.html_url : '',
+    notes: typeof j.body === 'string' ? j.body.slice(0, 2000) : '',
+    asset: asset ? { name: asset.name, size: asset.size, url: asset.browser_download_url } : undefined,
+  };
+}
+
+// 极简 zip 读取：.cindy 就是普通 zip，只需要「列条目 + 解到目录」这一件事。
+// （test/_unzip.cjs 是同一份逻辑，但测试目录不会被打进插件包，所以这里独立一份。）
+function readZipEntries(buf) {
+  let eocd = -1;
+  const minPos = Math.max(0, buf.length - 22 - 65535);
+  for (let i = buf.length - 22; i >= minPos; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('不是有效的 zip：找不到中央目录结尾');
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const out = [];
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error('中央目录条目签名不对');
+    const method = buf.readUInt16LE(off + 10);
+    const compSize = buf.readUInt32LE(off + 20);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const commentLen = buf.readUInt16LE(off + 32);
+    const localOff = buf.readUInt32LE(off + 42);
+    const name = buf.toString('utf8', off + 46, off + 46 + nameLen);
+    if (buf.readUInt32LE(localOff) !== 0x04034b50) throw new Error('本地文件头签名不对：' + name);
+    const lNameLen = buf.readUInt16LE(localOff + 26);
+    const lExtraLen = buf.readUInt16LE(localOff + 28);
+    const dataStart = localOff + 30 + lNameLen + lExtraLen;
+    const raw = buf.subarray(dataStart, dataStart + compSize);
+    let data;
+    if (method === 0) data = raw;
+    else if (method === 8) data = zlib.inflateRawSync(raw);
+    else throw new Error(`不支持的压缩方式 ${method}：${name}`);
+    out.push({ name, data });
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
+function extractZipTo(buf, targetDir) {
+  const names = [];
+  for (const e of readZipEntries(buf)) {
+    const rel = e.name.replace(/\\/g, '/');
+    if (rel.startsWith('/') || rel.split('/').includes('..')) throw new Error('包里有不安全路径：' + e.name);
+    const dest = join(targetDir, ...rel.split('/'));
+    mkdirSync(require('node:path').dirname(dest), { recursive: true });
+    writeFileSync(dest, e.data);
+    names.push(rel);
+  }
+  return names;
+}
+
+/**
+ * 下载新版本、解到暂存目录，然后交给一个独立的 PowerShell 脚本去替换安装目录。
+ *
+ * 为什么必须交给独立脚本：Windows 上正在运行的 .js 文件被进程锁着，本进程覆盖自己
+ * 一定会 EBUSY／EPERM。那个脚本等本进程退出后再动文件，Cindy 随后会把 worker 重新
+ * 拉起来（实测约 24 秒），起来时读到的就是新文件。
+ * 替换前先整目录备份成 `<安装目录>.bak-<旧版本>`，拷坏了还能手工还原。
+ */
+async function applyUpdate() {
+  const info = await checkUpdate();
+  if (!info.hasUpdate) return { ...info, applied: false };
+  if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');
+
+  mkdirSync(UPDATE_DIR, { recursive: true });
+  const pkgPath = join(UPDATE_DIR, `${info.asset.name}`);
+  const res = await fetch(info.asset.url, {
+    headers: { 'User-Agent': 'trae-bridge' },
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!res.ok) throw new Error(`下载新版本失败：HTTP ${res.status}`);
+  const bytes = Buffer.from(await res.arrayBuffer());
+  writeFileSync(pkgPath, bytes);
+
+  const stageDir = join(UPDATE_DIR, `stage-${info.latest}`);
+  extractZipTo(bytes, stageDir);
+  if (!existsSync(join(stageDir, 'ghost.json'))) throw new Error('新包解出来没有 ghost.json，放弃更新');
+
+  const scriptPath = join(UPDATE_DIR, 'apply-update.ps1');
+  const backup = `${INSTALL_DIR}.bak-${info.current}`;
+  // 单引号里再转义单引号，PowerShell 字符串才不会被路径里的空格/引号截断。
+  const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  const script = [
+    `$ErrorActionPreference = 'Stop'`,
+    `$root = ${q(INSTALL_DIR)}`,
+    `$stage = ${q(stageDir)}`,
+    `$backup = ${q(backup)}`,
+    `$oldPid = ${process.pid}`,
+    `try { Wait-Process -Id $oldPid -Timeout 60 -ErrorAction SilentlyContinue } catch {}`,
+    `Start-Sleep -Milliseconds 300`,
+    `if (-not (Test-Path $backup)) { Copy-Item $root $backup -Recurse -Force }`,
+    `Copy-Item (Join-Path $stage '*') $root -Recurse -Force`,
+    `Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue`,
+  ].join('\r\n');
+  writeFileSync(scriptPath, script, 'utf8');
+
+  const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+    detached: true, stdio: 'ignore', windowsHide: true,
+  });
+  child.unref();
+
+  // 光交给脚本还不够：脚本里的 Wait-Process 得等到本进程真的退出才动文件。
+  // 这里主动退，让 Cindy 在 ~24 秒后把新文件拉起来；留 800ms 是给上面那条 RPC 回包写完 stdout。
+  // 如果哪天这条路径没退成功，脚本的 -Timeout 60 会兜底（虽然那时文件还锁着，替换会失败并在备份后报错）。
+  setTimeout(() => process.exit(0), 800);
+
+  return {
+    ...info,
+    applied: true,
+    backup,
+    scriptPath,
+    message: `已下载 ${info.latest} 并交给后台脚本替换；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
+  };
+}
+
+// ============================================================
+// 文生图：字节落盘
+// ============================================================
+//
+// Cindy 的工具返回是纯文本，塞不进 Buffer，所以生成完先写到磁盘再把路径交回去。
+// 文件放 DATA_DIR/images 下（不放进安装目录，重装覆盖不会丢图，也不会把包撑大）。
+
+const IMAGE_DIR = join(DATA_DIR, 'images');
+
+function imageExtOf(mimeType) {
+  const m = String(mimeType || '').toLowerCase();
+  if (m.includes('jpeg') || m.includes('jpg')) return 'jpg';
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('gif')) return 'gif';
+  return 'png';
+}
+
+function imageStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+async function drawImageToFile(prompt, size, signal) {
+  const cred = await refreshCredential(false);
+  if (!cred) {
+    const e = new Error(notSignedInMessage());
+    e.status = 401;
+    throw e;
+  }
+  if (!identity) {
+    const r = await refreshCredential(true);
+    if (!r) {
+      const e = new Error(notSignedInMessage());
+      e.status = 401;
+      throw e;
+    }
+  }
+  const out = await trae.drawImage(cred, identity, { prompt, size }, signal);
+  mkdirSync(IMAGE_DIR, { recursive: true });
+  const file = join(IMAGE_DIR, `trae-${imageStamp()}-${crypto.randomBytes(3).toString('hex')}.${imageExtOf(out.mimeType)}`);
+  writeFileSync(file, out.bytes);
+  return { file, bytes: out.bytes.length, mimeType: out.mimeType, model: out.model, uri: out.uri };
+}
+
 // JSON-RPC over stdio
 // ============================================================
 
@@ -1130,6 +1409,24 @@ rl.on('line', async (line) => {
     } else if (method === 'trae/boot') {
       if (!server) await boot();
       result = await buildStatus();
+    } else if (method === 'trae/checkUpdate') {
+      result = await checkUpdate();
+    } else if (method === 'trae/applyUpdate') {
+      result = await applyUpdate();
+    } else if (method === 'trae/drawImage') {
+      const params = req.params && typeof req.params === 'object' ? req.params : {};
+      const prompt = typeof params.prompt === 'string' ? params.prompt.trim() : '';
+      if (!prompt) throw new Error('prompt 不能为空');
+      const size = typeof params.size === 'string' && params.size.trim() ? params.size.trim() : undefined;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 190000);
+      let drawn;
+      try {
+        drawn = await drawImageToFile(prompt, size, controller.signal);
+      } finally {
+        clearTimeout(timer);
+      }
+      result = drawn;
     } else {
       reply({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
       return;

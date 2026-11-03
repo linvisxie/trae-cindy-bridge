@@ -213,6 +213,33 @@
     setTimeout(() => { btn.textContent = '签到'; load(); }, 2500);
   });
 
+  $('checkUpdate').addEventListener('click', async () => {
+    const btn = $('checkUpdate');
+    const msg = $('updateMsg');
+    btn.disabled = true; btn.textContent = '检查中…';
+    const r = await ask('checkUpdate', 30000);
+    btn.disabled = false; btn.textContent = '检查更新';
+    if (!r || r.error) {
+      msg.hidden = false;
+      msg.textContent = `检查失败：${(r && r.error) || '没响应'}`;
+      return;
+    }
+    msg.hidden = false;
+    if (!r.hasUpdate) {
+      msg.textContent = `已是最新版本（${r.current || '当前'}）。`;
+      return;
+    }
+    // 有新版本就把按钮变成「安装」，点第二次才真的下 —— 装完进程会退出重启，不该被误触。
+    msg.textContent = `发现新版本 ${r.latest}（当前 ${r.current}）。点「安装」由后台脚本替换，约 30 秒后生效。`;
+    btn.textContent = '安装';
+    btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = '安装中…';
+      const a = await ask('applyUpdate', 120000);
+      msg.textContent = (a && (a.message || a.error)) || '没拿到结果';
+      btn.disabled = false;
+    };
+  });
+
   load();
   setInterval(load, 15000);
 })();

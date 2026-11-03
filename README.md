@@ -126,6 +126,56 @@ salt 用内置的固定常量表（两张，对应两个类型头）。
 
 本机 `%APPDATA%` 下可能同时存在 `Trae CN` 与 `TRAE SOLO` 两份 storage.json（两个不同的 Trae 产品）。插件会遍历全部候选，剔掉已过期的，再按文件 **mtime 从新到旧**取最后登录的那一份 —— 0.1.4 修的就是「按目录名取第一份，结果一直用着几十天前的旧 token，面板永远未登录」。
 
+### 凭据会自己续期
+
+token 到期不用再重开客户端。走 Trae 自己的换票接口 `POST /trae/api/v3/oauth/ExchangeToken`：
+
+```
+DeviceProof = sign('sha256', "POST\n<path>\n<clientId>\n<refreshToken>\n<timestamp>\n<nonce>", 私钥)
+```
+
+- 私钥来自 `iCubeAuthInfo://icube-dc:<deviceId>`（同一套 AES 封装解出来的 **EC P-256** 密钥对）。节点 `crypto.sign('sha256', …)` 会按 PEM 自动判 ECDSA，写成 `RSA-SHA256` 会直接抛。
+- 六段必须用 `\n` 连接，用空格会回 `20403 Token device not match`。
+- ClientID：CN/SG 桌面版 `ono9krqynydwx5`（`IDE_PC`），SOLO 版 `en1oxy7wnw8j9n`（`SOLO_PC`）。
+- 没带设备密钥对的老客户端自动退回 legacy 接口 `/cloudide/api/v3/trae/oauth/ExchangeToken`（无 DeviceProof）。
+
+触发时机两个：凭据 **剩余有效期 < 5 分钟** 时提前换；对话撞上 `401` / `1001` 时当场换一次、再重试同一个请求（只试一次，不会死循环）。并发对话共用一次换票（单飞去重），免得几条请求各换各的把 refreshToken 轮转掉。
+
+**换到的票只放内存，不写回 `storage.json`** —— Trae 客户端自己也在写那个文件，从外面改会被它下一次 flush 覆盖。
+
+### 文生图
+
+新工具 `trae_draw_image`，两步半：
+
+```
+POST {chat}/api/ide/v1/tool_text_to_image   body 只允许 {prompt, image_size?}
+  → 扁平响应 {message:"success", uri:"<tos key>"}
+POST {chat}/api/ide/v1/get_resource_url     body 必须正是 {uri_list:[key]}
+  → {url_map:{"<key>":"<签名 URL>"}}
+GET  <签名 URL>                              裸 GET，不带任何 Trae 头
+```
+
+几个坑写在这里省得再踩：
+
+- 请求体**只认 `prompt` 和可选的 `image_size`**。多带 `mode_type` / `request_type` / `chat_mode` / `session_id` / `access_type` / `image_urls` / `watermark` 里任何一个，网关直接 400 空 body。
+- `image_size` 校验在上游：`宽x高` 或预设 `2k/3k/4k/square/square_hd/landscape/portrait`，**总像素必须落在 `[3686400, 16777216]`**（512×512、1024×1024 都会被拒）。默认 `1920x1920`，正好卡下限。
+- **`GET` 同一个路径不是取图，是又生成一张**（多扣一次积分）。取图必须先 `get_resource_url` 换签名地址。
+- 模型固定 `seedream_5`（请求体里没有 model 字段，服务端自选）。
+
+图片落到数据目录 `images/trae-<时间戳>-<随机>.<ext>`。**每张真实扣账号积分**，CN 个人版 1920×1920 一张约 8.8，上游不回传具体数字。
+
+### 自查更新
+
+面板「检查更新」按钮 / 工具 `trae_update`。读 GitHub Releases 的 REST 接口（公开仓库匿名可读，不依赖 gh CLI、不需要代理配置），比对 `ghost.json` 里的版本号，有新包就下载解到 `update/stage-<版本>`，然后交给一个 detached PowerShell 脚本：
+
+```
+Wait-Process -Id <当前 worker pid>   → 等自己退出
+Copy-Item <安装目录> <安装目录>.bak-<旧版本>  （仅在备份不存在时）
+Copy-Item stage\* <安装目录> -Recurse -Force
+```
+
+**为什么不能在本进程里直接覆盖**：Windows 上正在运行的 `.js` 被锁，自己覆盖自己一定 `EBUSY`／`EPERM`。Cindy 检测到 worker 退出后约 24 秒用新文件重新拉起。
+
 ### 额度与签到
 
 基址 `https://api.trae.cn`，四个端点：
@@ -343,9 +393,10 @@ kimi-k2.6
 - **运行时长**：worker 活了多久
 - **本地用量**：今天本地打了多少请求、多少 token（`usage.json`，按天按模型记账，留 60 天）
 - **Base URL / Token**：各一个复制按钮，Token 默认打码，点「显示」才露出来
+- **检查更新**：查 GitHub Releases 有没有新版；有的话按钮变成「安装」，点一下由后台脚本替换
 - **日志文件**：`bridge.log` 的完整路径，出问题先看它
 
-AI 侧也能问：`trae_status`、`trae_endpoint`、`trae_refresh`、`trae_checkin` 四个工具。
+AI 侧也能问：`trae_status`、`trae_endpoint`、`trae_refresh`、`trae_checkin`、`trae_draw_image`、`trae_update` 六个工具。
 
 ## 报错对照表
 
@@ -380,6 +431,8 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 | `%APPDATA%\CindyGlobal\trae-bridge\state.json` | 本地端点 token + 端口 |
 | `%APPDATA%\CindyGlobal\trae-bridge\models.json` | 模型目录缓存（30 分钟） |
 | `%APPDATA%\CindyGlobal\trae-bridge\usage.json` | 本地用量账本（按天按模型，留 60 天，原子写） |
+| `%APPDATA%\CindyGlobal\trae-bridge\images\` | `trae_draw_image` 生成的图片 |
+| `%APPDATA%\CindyGlobal\trae-bridge\update\` | 自查更新的下载包、暂存目录与替换脚本 |
 | `%APPDATA%\CindyGlobal\trae-bridge\bridge.log` | 运行日志，带 ISO 时间戳，超 2 MB 自动滚成 `.1` |
 
 **你的 Trae token 不会被写进这些文件** —— 每次都是现从 Trae 客户端目录里的 `storage.json` 解密，只在内存里用。
@@ -469,9 +522,10 @@ node test\features.js           :: 档位 / 上下文 / 倍率 / 额度 / 错误
 - **只支持 Windows。** 见上面「环境依赖」。
 - **v1 只做 CN 区**（Trae CN）+ 消费网关。企业版 / 国际版只留了配置位，没做验证，不承诺可用。
 - **`x-app-version` 可能不发**。插件会去读 `%LOCALAPPDATA%\Programs\Trae CN\...\product.json` 拿版本号；文件不存在就不发这个头。不影响登录与聊天，只是上游看到的客户端信息少一项。
-- **不会做文生图**。Trae 的文生图链路是另一套端点与参数，v1 没接。
+- **文生图只支持「从零生成」**。改图（把参考图一起发上去）要先经 `get_resource_upload_url` 预签名上传到 TOS，是另一条流水线，没接。
 - **没有账号池**。一个进程只用当前那一个登录态，不支持多号轮换 / 额度聚合。
 - **没有上下文档位切换**。窗口报的是实测可用上限（见上文表格），Cindy 侧不能按 128k / 200k / 1M 选档位裁剪请求 —— 窗口给多少就用多少。
+- **自动更新不是「静默」的**。要么点面板上的「检查更新」，要么让 AI 调 `trae_update`。没有做「启动时自动查、有新版自动装」—— 那意味着在你不知道的时候重启一次插件，而且中途断电可能留半个目录。
 - **Cindy 详情页的「报价」修不掉**。自定义供应商的模型解析器不读 `displayPricing` / `currency` / `cost` 任何字段，所以那句「该路由没有报价数据」删不掉；倍率只能写在模型名里和面板上。
 - **依赖 Trae 的内部接口**。上游一改，插件就失效。这不是「长期稳定」的东西。
 - **凭据格式一改就挂**。自有 AES 封装是逆向出来的，Trae 换加密方式（或者换 salt）之后必须先更新插件才能用。

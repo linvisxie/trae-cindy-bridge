@@ -2,8 +2,8 @@
   "schemaVersion": 3,
   "id": "trae-bridge",
   "name": "Trae 桥",
-  "version": "0.1.5",
-  "releaseNotes": "修代码审查（issue #1）报的 7 项：并行工具调用分片被拆成空名字的块、上游缺结束信号就 EOF 时把半截回答当完整、下游断连没取消上游、Anthropic / Responses 两路本地账本漏记真实输出 token、上游明确的 4xx/5xx 被一律盖成 502、.cindy 包里缺 LICENSE / NOTICE / 第三方声明、模型缓存二次归一化把档位和倍率抹掉。另补聊天请求 180 秒总超时与流 reader 泄漏。",
+  "version": "0.1.6",
+  "releaseNotes": "新增三件事：① token 自动续期 —— 用 Trae 自己的 ExchangeToken 接口（DeviceProof 用 storage.json 里的 EC 私钥签），凭据快到期时提前换、对话撞上 401 时也当场换一次再重试，过期不必再手工重登；② 文生图 —— 新工具 trae_draw_image，走 Trae 的 tool_text_to_image + get_resource_url 两步，图片落到数据目录 images/ 下；③ 自查更新 —— 面板「检查更新」按钮与新工具 trae_update，从 GitHub Releases 拉最新 .cindy，交给独立脚本在本进程退出后替换（Windows 上不能自己覆盖自己）。",
   "minCindyVersion": "0.1.119",
   "author": "linvis",
   "description": "读取本机 Trae CN 客户端的登录状态，在本机起一个 OpenAI / Anthropic 兼容接口，供 Cindy 的「自定义供应商」指向。不修改 Cindy 任何文件，也不会替你填供应商配置。",
@@ -50,6 +50,40 @@
       "parameters": {
         "type": "object",
         "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trae_draw_image",
+      "description": "用 Trae 账号里的文生图能力（模型 seedream_5）生成一张图，保存到本机并把文件路径返回给你。每张真实扣该账号的 Trae 积分（CN 个人版 1920x1920 一张约 8.8 积分，上游不回传具体数字，以 Trae 额度面板为准），所以只在该用户明确要画图时调用，不要为了试一下而调用。用户说「画一张」「生成图片」「文生图」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "画面描述，尽量具体（主体、风格、光线、构图）。必填。"
+          },
+          "size": {
+            "type": "string",
+            "description": "可选尺寸，形如 1024x1024 的总像素必须落在 3686400~16777216 之间，也可以传预设 2k / 3k / 4k / square / square_hd / landscape / portrait。不传默认 1920x1920（总像素 3686400，正好卡在下限）。"
+          }
+        },
+        "required": ["prompt"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "trae_update",
+      "description": "检查并安装 Trae 桥自身的新版本（从 GitHub Releases 拉最新 .cindy）。action=check 只查有没有新版；action=apply 会下载并交给后台脚本替换，本进程随后退出，Cindy 约 20~30 秒后用新版重新拉起 worker。用户问「插件有没有新版」「更新一下 Trae 桥」时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["check", "apply"],
+            "description": "check=只检查（默认），apply=下载并安装。"
+          }
+        },
         "additionalProperties": false
       }
     }

@@ -30,10 +30,10 @@ function unwrap(res) {
   return cur;
 }
 
-async function callWorker(method, callId) {
+async function callWorker(method, callId, params) {
   const res = await cindy.node.request({
     method,
-    params: {},
+    params: params && typeof params === 'object' ? params : {},
     // 工具调用内带上 callId，让主机把这次 Node 请求绑定到当前在途调用；
     // 面板触发的请求没有 callId，走独立 RPC 生命周期（文档允许）。
     ...(callId ? { callId, cancelWithCall: true } : {}),
@@ -179,6 +179,41 @@ cindy.onHostMessage(async function (msg) {
       return;
     }
 
+    if (msg.tool === 'trae_draw_image') {
+      const args = msg.args && typeof msg.args === 'object' ? msg.args : {};
+      const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+      if (!prompt) { fail('prompt 不能为空：要画什么？'); return; }
+      const size = typeof args.size === 'string' && args.size.trim() ? args.size.trim() : undefined;
+      const r = await callWorker('trae/drawImage', msg.callId, { prompt, ...(size ? { size } : {}) });
+      const kb = Math.max(1, Math.round((r.bytes || 0) / 1024));
+      ok({
+        text: [
+          `![Trae 文生图](${r.file})`,
+          `文生图 · 模型：${r.model || 'seedream_5'} · 尺寸：${size || '1920x1920'} · ${kb} KB`,
+          `文件：${r.file}`,
+          '这张真实扣了 Trae 积分（1920x1920 约 8.8），具体数字以 Trae 额度面板为准。',
+        ].join('\n'),
+      });
+      return;
+    }
+
+    if (msg.tool === 'trae_update') {
+      const args = msg.args && typeof msg.args === 'object' ? msg.args : {};
+      const apply = args.action === 'apply';
+      const r = await callWorker(apply ? 'trae/applyUpdate' : 'trae/checkUpdate', msg.callId);
+      if (apply) {
+        lastStatus = null;
+        ok({ text: r.applied ? r.message : `已经是最新的（${r.current || '当前版本'}），没有可安装的新版。` });
+        return;
+      }
+      const lines = [`当前版本：${r.current || '(未知)'}`, `最新版本：${r.latest || '(未知)'}`];
+      lines.push(r.hasUpdate ? '有新版本，可以让 Trae 桥自己装（action=apply）。' : '已经是最新的。');
+      if (r.hasUpdate && r.asset) lines.push(`新包：${r.asset.name}（${Math.round((r.asset.size || 0) / 1024)} KB）`);
+      if (r.htmlUrl) lines.push(`发布页：${r.htmlUrl}`);
+      ok({ text: lines.join('\n') });
+      return;
+    }
+
     fail(`未知工具：${msg.tool}`);
   } catch (e) {
     fail(`Trae 桥内部错误：${e && e.message ? e.message : String(e)}。可在插件面板查看状态。`);
@@ -224,6 +259,17 @@ if (channel) {
         const r = await callWorker('trae/checkin');
         lastStatus = null;
         send(r);
+      } else if (action === 'checkUpdate') {
+        send(await callWorker('trae/checkUpdate'));
+      } else if (action === 'applyUpdate') {
+        const r = await callWorker('trae/applyUpdate');
+        lastStatus = null;
+        send(r);
+      } else if (action === 'drawImage') {
+        const prompt = typeof data.prompt === 'string' ? data.prompt.trim() : '';
+        if (!prompt) { send({ error: 'prompt 不能为空' }); return; }
+        const size = typeof data.size === 'string' && data.size.trim() ? data.size.trim() : undefined;
+        send(await callWorker('trae/drawImage', undefined, { prompt, ...(size ? { size } : {}) }));
       } else {
         send(null);
       }

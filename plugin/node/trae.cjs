@@ -14,7 +14,7 @@ const { readFileSync, existsSync, statSync } = require('node:fs');
 const { join } = require('node:path');
 const os = require('node:os');
 const {
-  createDecipheriv, createHash, randomUUID,
+  createDecipheriv, createHash, randomBytes, randomUUID, sign,
 } = require('node:crypto');
 
 // ============================================================
@@ -86,6 +86,15 @@ const MEASURED_CONTEXT = {
 
 const AUTH_STORAGE_KEY = 'iCubeAuthInfo://icube.cloudide';
 const DEVICE_CENTER_PREFIX = 'iCubeAuthInfo://icube-dc:';
+
+// token 续期（ExchangeToken）。路径与 ClientID 照 lib/index.js:3535-3570。
+// 两个 ClientID 不能混用：SOLO 的 refreshToken 拿 IDE 的 ClientID 去换会回 10101，
+// 反之亦然 —— 这条是 OAuth client 层面强制的，不是端点行为。
+const EXCHANGE_TOKEN_PATH = '/trae/api/v3/oauth/ExchangeToken';
+const LEGACY_EXCHANGE_TOKEN_PATH = '/cloudide/api/v3/trae/oauth/ExchangeToken';
+const DESKTOP_CLIENT_ID = 'ono9krqynydwx5';
+const SOLO_CLIENT_ID = 'en1oxy7wnw8j9n';
+const REFRESH_TIMEOUT_MS = 30000;
 
 // 上游目录全挂时用的兜底清单（lib/index.js:131 的 CN 组）。
 // contextWindow 用实测值，别用目录里的 dev —— 见 MEASURED_CONTEXT 的说明。
@@ -226,6 +235,33 @@ function deviceTypeOf() {
   return process.platform;
 }
 
+// 目录名 → 版本代号。ClientID 跟它绑定（见 EXCHANGE_TOKEN 常量注释）。
+function editionOf(appName) {
+  const n = String(appName || '').toLowerCase().replace(/\s+/g, '');
+  if (n === 'traecn' || n === 'trae-cn') return 'cn';
+  if (n === 'traesolocn' || n === 'trae-solo-cn') return 'solo';
+  if (n === 'traesolo' || n === 'trae-solo') return 'solo-sg';
+  return 'sg';
+}
+
+// storage.json 里那对设备密钥（用来给 token 续期的 DeviceProof 签名）。
+// 老版本客户端没有这对密钥 → 返回 undefined，续期就只能走 legacy 那条。
+function deviceKeyPairOf(storage) {
+  const key = Object.keys(storage).find((k) => k.startsWith(DEVICE_CENTER_PREFIX));
+  if (!key) return undefined;
+  try {
+    const raw = storage[key];
+    if (typeof raw !== 'string' || !raw.trim()) return undefined;
+    const plain = parseAuthValue(raw);
+    if (!plain || typeof plain !== 'object' || Array.isArray(plain)) return undefined;
+    const priv = typeof plain.privateKeyPEM === 'string' ? plain.privateKeyPEM.trim() : '';
+    const pub = typeof plain.publicKeyPEM === 'string' ? plain.publicKeyPEM.trim() : '';
+    return priv && pub ? { privateKeyPEM: priv, publicKeyPEM: pub } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // 把一份 storage.json 解成 {credential, identity}，解不出来就返回 null。
 function parseCredentialAt(cand) {
   let storage;
@@ -260,6 +296,7 @@ function parseCredentialAt(cand) {
     host: auth.host ? String(auth.host) : '',
     expiresAtMs: timeToMs(auth.expiredAt ?? auth.expiresAt),
     refreshExpiresAtMs: timeToMs(auth.refreshExpiredAt ?? auth.refreshExpiresAt),
+    edition: editionOf(cand.appName),
   };
 
   const machineId = String(storage['telemetry.machineId'] || '');
@@ -275,6 +312,8 @@ function parseCredentialAt(cand) {
     appVersion: readAppVersion(cand.appName),
     deviceType: deviceTypeOf(),
     osVersion: `${os.type()} ${os.release()}`,
+    // 续期要拿它签 DeviceProof；只有签名时才用得到，读不到就是 undefined。
+    deviceKeyPair: deviceKeyPairOf(storage),
   };
 
   return { credential, identity, mtimeMs };
@@ -1140,16 +1179,308 @@ async function claimCheckin(credential, identity) {
   };
 }
 
+// ============================================================
+// token 续期（ExchangeToken）
+// ============================================================
+//
+// 为什么要有这一段：Trae 的 access token 只有几天寿命。客户端在跑的时候自己会续，
+// 但插件读的是磁盘上的 storage.json —— 用户几天不开 Trae，插件就一路 401，
+// 面板显示「未登录」，人得重新打开客户端登录。这里直接用 refreshToken 换新 token，
+// 换到的 token 只放内存，**不写回 storage.json**：那个文件 Trae 自己也在写，
+// 从外面改会被它下一次 flush 覆盖掉，属于给自己挖坑。
+
+// 六段用 **换行** 连接。用空格拼同样的字段会被判「20403 Token device not match」，
+// 跟密钥错一模一样，往错误方向查很久。
+function deviceProofMessage(path, clientId, refreshToken, timestamp, nonce) {
+  return ['POST', path, clientId, refreshToken, String(timestamp), nonce].join('\n');
+}
+
+function signDeviceProof(path, clientId, refreshToken, privateKeyPEM, timestamp, nonce) {
+  const ts = timestamp === undefined ? Math.floor(Date.now() / 1000) : timestamp;
+  const nc = nonce === undefined ? randomBytes(16).toString('hex') : nonce;
+  const message = deviceProofMessage(path, clientId, refreshToken, ts, nc);
+  // PEM 是 EC 私钥，crypto.sign('sha256', …) 会按曲线自动走 ECDSA；
+  // 写成 'RSA-SHA256' 会直接抛。
+  const signature = sign('sha256', Buffer.from(message), privateKeyPEM).toString('base64');
+  return { Signature: signature, Timestamp: ts, Nonce: nc };
+}
+
+function osInfoWord() {
+  if (process.platform === 'darwin') return 'mac';
+  if (process.platform === 'win32') return 'windows';
+  return process.platform;
+}
+
+function refreshContractOf(credential) {
+  const edition = credential.edition || 'cn';
+  const clientId = edition === 'solo' || edition === 'solo-sg' ? SOLO_CLIENT_ID : DESKTOP_CLIENT_ID;
+  const platformCode = edition === 'solo' || edition === 'solo-sg' ? 'SOLO_PC' : 'IDE_PC';
+  return { path: EXCHANGE_TOKEN_PATH, clientId, platformCode };
+}
+
+function currentRefreshBody(credential, identity, contract) {
+  const keyPair = identity && identity.deviceKeyPair;
+  const osWord = osInfoWord();
+  return {
+    ClientID: contract.clientId,
+    ClientSecret: '',
+    RefreshToken: credential.refreshToken,
+    DeviceInfo: {
+      DeviceID: identity.deviceId || '',
+      MachineID: identity.machineId || '',
+      PlatformCode: contract.platformCode,
+      DeviceType: 'PC',
+      DevicePublicKey: keyPair.publicKeyPEM,
+      OSInfo: osWord,
+      OSVersion: identity.osVersion || `${osWord} ${os.hostname()}`,
+      ...(identity.appVersion ? { ClientVersion: identity.appVersion } : {}),
+    },
+    DeviceProof: signDeviceProof(contract.path, contract.clientId, credential.refreshToken || '', keyPair.privateKeyPEM),
+    ...(identity.appVersion ? { IDEVersion: identity.appVersion } : {}),
+  };
+}
+
+function legacyRefreshBody(credential, contract) {
+  return {
+    ClientID: contract.clientId,
+    ClientSecret: '-',
+    RefreshToken: credential.refreshToken,
+    UserID: credential.userId || '',
+  };
+}
+
+function parseExchangeOutcome(payload, label) {
+  const result = (payload && payload.Result) || {};
+  const token = typeof result.Token === 'string' ? result.Token : '';
+  if (!token) throw new Error(`${label}: 上游没返回 token`);
+  const expiresAtMs = timeToMs(result.TokenExpireAt);
+  if (!expiresAtMs) throw new Error(`${label}: 上游返回的过期时间读不出来`);
+  const refreshToken = typeof result.RefreshToken === 'string' && result.RefreshToken ? result.RefreshToken : undefined;
+  const refreshExpiresAtMs = timeToMs(result.RefreshExpireAt) || undefined;
+  return { token, expiresAtMs, refreshToken, refreshExpiresAtMs };
+}
+
+async function postExchange(host, path, body, signal, label) {
+  const base = String(host || PAY_BASE).replace(/\/$/, '');
+  const res = await fetch(`${base}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: signal === undefined ? AbortSignal.timeout(REFRESH_TIMEOUT_MS) : AbortSignal.any([signal, AbortSignal.timeout(REFRESH_TIMEOUT_MS)]),
+  });
+  if (!res.ok) throw new Error(`${label}: HTTP ${res.status}`);
+  return parseExchangeOutcome(await res.json().catch(() => null), label);
+}
+
+/**
+ * 拿 refreshToken 换一个新的 access token。
+ *
+ * 先走现在的契约（带 DeviceProof）；本机 storage.json 没有设备密钥对时跳过它
+ * 直接走 legacy —— 没密钥可签，发出去只会被 20405 拒。
+ * 两条都失败时把两次失败都写进错误里，别让人对着「登录过期」瞎猜。
+ */
+async function refreshAccessToken(credential, identity, signal) {
+  if (!credential || !credential.refreshToken) throw new Error('没有 refreshToken，只能重新登录 Trae');
+  const contract = refreshContractOf(credential);
+  const attempts = [];
+  const keyPair = identity && identity.deviceKeyPair;
+
+  if (!keyPair) {
+    attempts.push(`${contract.path}: 本机 storage.json 里没有设备密钥对，跳过`);
+  } else {
+    try {
+      return await postExchange(credential.host, contract.path, currentRefreshBody(credential, identity, contract), signal, 'Trae token 续期');
+    } catch (e) {
+      attempts.push(`${contract.path}: ${e.message}`);
+    }
+  }
+
+  try {
+    return await postExchange(credential.host, LEGACY_EXCHANGE_TOKEN_PATH, legacyRefreshBody(credential, contract), signal, 'Trae token 续期（legacy）');
+  } catch (e) {
+    attempts.push(`${LEGACY_EXCHANGE_TOKEN_PATH}: ${e.message}`);
+  }
+
+  throw new Error(`Trae token 续期失败 —— ${attempts.join('；')}`);
+}
+
+// ============================================================
+// 文生图（tool_text_to_image → get_resource_url → 下载）
+// ============================================================
+//
+// 规格照 lib/index.js:10200-10510，几条实测出来的硬约束：
+//   · 请求体**只能**有 {prompt, image_size?}，多发任何已知字段网关直接 400 空 body；
+//   · image_size 总像素必须在 [3686400, 16777216]，512x512 / 1024x1024 会被拒；
+//   · 应答是扁平 JSON（成功 {message:"success", uri}，失败 {code,message}），没有 {code:0,data} 信封；
+//   · GET 同一个路径不是取图，是再画一张（再扣一次积分）。
+const IMAGE_PATH = '/api/ide/v1/tool_text_to_image';
+const RESOURCE_URL_PATH = '/api/ide/v1/get_resource_url';
+const IMAGE_MODEL = 'seedream_5';
+const IMAGE_TIMEOUT_MS = 180000;
+const IMAGE_SIZE_PRESETS = ['2k', '3k', '4k', 'square', 'square_hd', 'landscape', 'portrait'];
+const IMAGE_MIN_PIXELS = 3686400;
+const IMAGE_MAX_PIXELS = 16777216;
+const DEFAULT_IMAGE_SIZE = '1920x1920';
+
+function imageSizeOk(size) {
+  const s = String(size || '').trim().toLowerCase();
+  if (IMAGE_SIZE_PRESETS.includes(s)) return true;
+  const m = /^(\d+)x(\d+)$/.exec(s);
+  if (!m) return false;
+  const pixels = Number(m[1]) * Number(m[2]);
+  return pixels >= IMAGE_MIN_PIXELS && pixels <= IMAGE_MAX_PIXELS;
+}
+
+function buildImageBody(input) {
+  const prompt = String((input && input.prompt) || '').trim();
+  if (!prompt) throw new Error('prompt 不能为空');
+  const body = { prompt };
+  const size = String((input && input.size) || '').trim().toLowerCase();
+  if (size) {
+    if (!imageSizeOk(size)) {
+      throw new Error(`尺寸「${size}」不被接受（要 宽x高 且总像素 ${IMAGE_MIN_PIXELS}~${IMAGE_MAX_PIXELS}，或预设 ${IMAGE_SIZE_PRESETS.join('/')}）`);
+    }
+    body.image_size = size;
+  }
+  return body;
+}
+
+const IMAGE_URL_FIELDS = ['uri', 'tos_uri', 'display_url', 'image_url', 'original_url', 'preview_url', 'internal_url'];
+
+function findImageUri(node, depth = 0) {
+  if (depth > 4 || node === null || typeof node !== 'object') return undefined;
+  for (const f of IMAGE_URL_FIELDS) {
+    const v = node[f];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  for (const v of Object.values(node)) {
+    if (v !== null && typeof v === 'object') {
+      const found = findImageUri(v, depth + 1);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
+function parseImageResponse(json) {
+  const rec = json !== null && typeof json === 'object' ? json : {};
+  const code = typeof rec.code === 'number' ? rec.code : undefined;
+  const message = typeof rec.message === 'string' ? rec.message : '';
+  if (code !== undefined && code !== 0) {
+    const err = new Error(`上游业务错误 code=${code}${message ? `：${message}` : ''}`);
+    err.upstreamCode = String(code);
+    throw err;
+  }
+  const uri = findImageUri(rec);
+  if (!uri) throw new Error(`应答里没有图片地址${message ? `（message=${message}）` : ''}`);
+  return uri;
+}
+
+function imageErrorOf(status, detail, stage) {
+  const tail = detail ? `：${String(detail).slice(0, 200)}` : '';
+  if (stage === 'retrieve') {
+    // 图已经画完、积分已经扣掉。这时候说「凭据被拒」是谎报，人会跑去重登。
+    const err = new Error(`图片已经生成、积分已经扣了，但取图接口回了 HTTP ${status}${tail}`);
+    err.status = 502;
+    err.imageStage = 'retrieve';
+    return err;
+  }
+  const err = new Error(`上游 HTTP ${status}${tail}`);
+  err.status = status === 429 ? 429 : (status === 401 || status === 403 ? 401 : 502);
+  err.imageStage = 'generate';
+  return err;
+}
+
+/**
+ * 画一张图并把字节取回来。
+ *
+ * 三步都是真打上游：生成（扣积分）→ 解析签名地址（不扣）→ 下载字节（不扣）。
+ * 第二步失败时图已经花了钱，所以错误文案必须说清「图已生成、积分已扣」，
+ * 否则用户会以为没成、重试一次，再花一笔。
+ */
+async function drawImage(credential, identity, input, signal) {
+  const body = buildImageBody(input);
+  const timeout = () => AbortSignal.timeout(IMAGE_TIMEOUT_MS);
+  const merged = signal === undefined ? timeout() : AbortSignal.any([signal, timeout()]);
+  const headers = buildHeaders(credential, identity, 'model-detail');
+
+  let res;
+  try {
+    res = await fetch(`${CHAT_BASE}${IMAGE_PATH}`, {
+      method: 'POST', headers, body: JSON.stringify(body), signal: merged,
+    });
+  } catch (e) {
+    const err = new Error(`生图请求发不出去：${e.message}`);
+    err.status = 502;
+    err.imageStage = 'generate';
+    throw err;
+  }
+  const text = await res.text().catch(() => '');
+  if (!res.ok) throw imageErrorOf(res.status, text, 'generate');
+  let json;
+  try { json = JSON.parse(text); } catch {
+    const err = new Error(`生图应答不是 JSON（HTTP 200）：${text.slice(0, 200)}`);
+    err.status = 502;
+    err.imageStage = 'generate';
+    throw err;
+  }
+  const uri = parseImageResponse(json);
+
+  // 解析签名地址：body 必须正是 {uri_list:[key]}，其它形态都回 200 + 空 url_map（不报错也不给图）。
+  let signed;
+  try {
+    const r2 = await fetch(`${CHAT_BASE}${RESOURCE_URL_PATH}`, {
+      method: 'POST', headers, body: JSON.stringify({ uri_list: [uri] }), signal: merged,
+    });
+    const t2 = await r2.text().catch(() => '');
+    if (!r2.ok) throw imageErrorOf(r2.status, t2, 'retrieve');
+    const j2 = JSON.parse(t2);
+    const map = (j2 && typeof j2.url_map === 'object' && j2.url_map) || {};
+    signed = typeof map[uri] === 'string' && map[uri].trim() ? map[uri].trim() : undefined;
+    if (!signed) {
+      const err = new Error(`图片已经生成、积分已经扣了，但服务端没给出可下载地址（url_map 里没有这个 key）：${uri}`);
+      err.status = 502;
+      err.imageStage = 'retrieve';
+      throw err;
+    }
+  } catch (e) {
+    if (e && e.imageStage) throw e;
+    const err = new Error(`图片已经生成、积分已经扣了，但解析下载地址失败：${e.message}`);
+    err.status = 502;
+    err.imageStage = 'retrieve';
+    throw err;
+  }
+
+  // 下载：签名在 query 里，CDN 不需要任何 Trae 头。
+  let img;
+  try {
+    img = await fetch(signed, { method: 'GET', signal: merged });
+  } catch (e) {
+    const err = new Error(`图片已经生成、积分已经扣了，但下载失败：${e.message}`);
+    err.status = 502;
+    err.imageStage = 'retrieve';
+    throw err;
+  }
+  if (!img.ok) throw imageErrorOf(img.status, '', 'retrieve');
+  const bytes = Buffer.from(await img.arrayBuffer());
+  const mimeType = img.headers.get('content-type') || 'image/jpeg';
+  return { uri, url: signed, bytes, mimeType, model: IMAGE_MODEL };
+}
+
 module.exports = {
   REGION,
   REASONING_EFFORTS,
   FALLBACK_MODELS,
+  IMAGE_MODEL,
+  DEFAULT_IMAGE_SIZE,
   readTraeCredential,
   fetchModels,
   streamChat,
   refreshUsage,
   refreshCheckin,
   claimCheckin,
+  refreshAccessToken,
+  drawImage,
   // 下面几个导出给自测/排查用，worker 不依赖。
   buildHeaders,
   decryptTraeStorageValue,
@@ -1157,4 +1488,9 @@ module.exports = {
   prepareSoloBody,
   SseDecoder,
   decodeTraeEvent,
+  deviceProofMessage,
+  signDeviceProof,
+  buildImageBody,
+  imageSizeOk,
+  parseImageResponse,
 };

@@ -4,6 +4,27 @@
 
 ---
 
+## 0.1.6
+
+**2026-11-03** · 补齐三条以前写在「已知限制」里的能力：token 自动续期、文生图、自查更新
+
+### 新增
+
+1. **token 自动续期**。以前 Trae 的登录凭据一过期就只能重开客户端重登。现在走 Trae 自己的 `POST /trae/api/v3/oauth/ExchangeToken`：DeviceProof 用 `storage.json` 里 `iCubeAuthInfo://icube-dc:*` 的 EC 私钥签（`sign('sha256', …)`，Node 会按 PEM 自动判 ECDSA，写成 `RSA-SHA256` 会直接抛），六段待签串必须用 `\n` 连接，用空格会回 `20403 Token device not match`。快到期（<5 分钟）时提前换；对话撞上 401/1001 时当场换一次再重试同一个请求。换到的票只放内存、不写回 `storage.json`（Trae 客户端自己也在写那个文件，从外面改会被它下一次 flush 覆盖）。老客户端没有设备密钥对时自动退回 legacy 接口（`/cloudide/api/v3/trae/oauth/ExchangeToken`，无 DeviceProof）。
+2. **文生图**。新工具 `trae_draw_image`，走 `POST /api/ide/v1/tool_text_to_image`（模型 `seedream_5`，body 只允许 `{prompt, image_size?}`，多带一个字段就被网关 400 拒），再 `POST /api/ide/v1/get_resource_url` 换签名地址，最后裸 GET 下载（签名在 query 里，不能带 Trae 头）。图片落到数据目录 `images/trae-<时间戳>-<随机>.<ext>`，返回路径与体积。尺寸总像素必须落在 `[3686400, 16777216]`，默认 `1920x1920`。
+3. **自查更新**。面板新增「检查更新」按钮，工具侧新增 `trae_update`（`action=check` / `apply`）。读 GitHub Releases 的 REST 接口（公开仓库匿名可读，不依赖 gh CLI 与代理配置），下载 `.cindy`、解到暂存目录，然后交给一个 detached PowerShell 脚本等本进程退出后再替换安装目录 —— Windows 上正在运行的 `.js` 被锁，自己覆盖自己一定 EBUSY／EPERM。替换前整目录备份成 `<安装目录>.bak-<旧版本>`，Cindy 约 24 秒后用新文件重新拉起 worker。
+
+### 顺带
+
+- `main.js` 的 `callWorker` 现在能带 `params`（文生图的 prompt/size 与更新的 action 都要传参）；面板侧新增 `checkUpdate` / `applyUpdate` / `drawImage` 三个 action。
+- `worker.cjs` 顶部补 `zlib` / `spawn` / `existsSync` 的 require（解 zip 与起后台脚本用）。
+
+### 测试
+
+`features 51/0`、`host-guard 13/0`、`responses-status 19/0`、`upstream-contract 16/0`、`smoke-protocols 19/0`、`smoke-tools 11/0`、`wire-quirks 10/0`、`e2e-package 24/0`、`e2e-panel 17/17`、`e2e-brain 13/13`、`verify-manifest PASS`。
+
+---
+
 ## 0.1.5
 
 **2026-11-03** · 修代码审查（issue #1）报的 7 项

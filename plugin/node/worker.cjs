@@ -13,7 +13,7 @@ const zlib = require('node:zlib');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { join } = require('node:path');
-const { readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync, existsSync } = require('node:fs');
+const { readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, unlinkSync, existsSync, mkdtempSync, rmSync } = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const adapters = require('./adapters.cjs');
 const trae = require('./trae.cjs');
@@ -32,6 +32,8 @@ let credential;
 let identity;
 let credentialAt = 0;
 let credentialError = '';
+let diskCredentialFingerprint = '';
+let credentialGeneration = 0;
 let models = [];
 let modelsAt = 0;
 let server;
@@ -87,18 +89,26 @@ async function refreshCredential(force) {
   try {
     const r = trae.readTraeCredential();
     if (r && r.ok) {
-      credential = r.credential;
+      const fingerprint = crypto.createHash('sha256').update(JSON.stringify([
+        r.identity?.storagePath, r.credential.userId, r.credential.accountName,
+        r.credential.edition, r.credential.host, r.credential.token, r.credential.refreshToken,
+      ])).digest('hex');
+      if (!credential || fingerprint !== diskCredentialFingerprint) {
+        credential = r.credential;
+        diskCredentialFingerprint = fingerprint;
+        credentialGeneration += 1;
+      }
       identity = r.identity;
       credentialAt = Date.now();
       credentialError = '';
     } else {
       credentialError = (r && r.reason) || 'read-failed';
-      if (force) { credential = undefined; identity = undefined; }
+      if (force) { credential = undefined; identity = undefined; diskCredentialFingerprint = ''; credentialAt = 0; credentialGeneration += 1; }
     }
   } catch (e) {
     credentialError = e.message;
     log('credential read failed', e.message);
-    if (force) { credential = undefined; identity = undefined; }
+    if (force) { credential = undefined; identity = undefined; diskCredentialFingerprint = ''; credentialAt = 0; credentialGeneration += 1; }
   }
   // 读到凭据但已经过期（或 5 分钟内到期）就顺手续一次：
   // 用户的 Trae 客户端可能十几天没开，storage.json 里那张票早死了，
@@ -122,16 +132,20 @@ let renewing = null;
  */
 async function renewCredential(reason) {
   if (!credential || !credential.refreshToken) return false;
-  if (renewing) return renewing;
-  renewing = (async () => {
+  const generation = credentialGeneration;
+  if (renewing && renewing.generation === generation) return renewing.promise;
+  const sourceCredential = credential;
+  const sourceIdentity = identity;
+  const pending = (async () => {
     try {
-      const out = await trae.refreshAccessToken(credential, identity);
+      const out = await trae.refreshAccessToken(sourceCredential, sourceIdentity);
+      if (credentialGeneration !== generation) return false;
       credential = {
-        ...credential,
+        ...sourceCredential,
         token: out.token,
         expiresAtMs: out.expiresAtMs,
-        refreshToken: out.refreshToken || credential.refreshToken,
-        refreshExpiresAtMs: out.refreshExpiresAtMs || credential.refreshExpiresAtMs,
+        refreshToken: out.refreshToken || sourceCredential.refreshToken,
+        refreshExpiresAtMs: out.refreshExpiresAtMs || sourceCredential.refreshExpiresAtMs,
       };
       credentialAt = Date.now();
       log(`token 已续期（${reason || '主动'}）`, `新到期 ${new Date(out.expiresAtMs).toISOString()}`);
@@ -141,10 +155,12 @@ async function renewCredential(reason) {
       return false;
     }
   })();
+  const operation = { generation, promise: pending };
+  renewing = operation;
   try {
-    return await renewing;
+    return await pending;
   } finally {
-    renewing = null;
+    if (renewing === operation) renewing = null;
   }
 }
 
@@ -960,7 +976,7 @@ async function anthropicMessages(req, res) {
     up.cancelOnClose.done();
     // 上游给了真实 usage 就用真实的，没给才退回估算；输出侧以前写死 0，账本里永远是 0 token。
     const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
-    recordUsage(entry || { model: displayModel }, 'anthropic', opts.inputTokens, out);
+    recordUsage(entry || { model: displayModel }, 'anthropic', opts.usage?.prompt_tokens ?? opts.inputTokens, out);
   }
 }
 
@@ -1010,7 +1026,7 @@ async function openaiResponses(req, res) {
   } finally {
     up.cancelOnClose.done();
     const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
-    recordUsage(entry || { model: displayModel }, 'responses', opts.inputTokens, out);
+    recordUsage(entry || { model: displayModel }, 'responses', opts.usage?.prompt_tokens ?? opts.inputTokens, out);
   }
 }
 
@@ -1184,7 +1200,7 @@ async function checkUpdate() {
   if (!res.ok) throw new Error(`查更新失败：GitHub 返回 HTTP ${res.status}`);
   const j = await res.json();
   const latest = String(j.tag_name || '').replace(/^v/i, '');
-  const asset = (Array.isArray(j.assets) ? j.assets : []).find((a) => typeof a.name === 'string' && a.name.endsWith('.cindy'));
+  const asset = (Array.isArray(j.assets) ? j.assets : []).find((a) => a && a.name === 'trae-cindy-bridge.cindy');
   return {
     current: mine,
     latest,
@@ -1216,7 +1232,6 @@ async function applyUpdate() {
   if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');
 
   mkdirSync(UPDATE_DIR, { recursive: true });
-  const pkgPath = join(UPDATE_DIR, `${info.asset.name}`);
   const res = await fetch(info.asset.url, {
     headers: { 'User-Agent': 'trae-bridge' },
     signal: AbortSignal.timeout(120000),
@@ -1229,29 +1244,36 @@ async function applyUpdate() {
   if (!check.ok) throw new Error(check.reason);
   if (check.skipped) log('发布记录没给 digest 也没给 size，跳过完整性校验');
 
-  writeFileSync(pkgPath, bytes);
-
-  const stageDir = join(UPDATE_DIR, `stage-${info.latest}`);
-  extractZipTo(bytes, stageDir);
-  if (!existsSync(join(stageDir, 'ghost.json'))) throw new Error('新包解出来没有 ghost.json，放弃更新');
-
-  const scriptPath = join(UPDATE_DIR, 'apply-update.ps1');
-  const syncScriptPath = join(UPDATE_DIR, 'sync-snapshot.cjs');
-  const backup = `${INSTALL_DIR}.bak-${info.current}`;
-  writeFileSync(syncScriptPath, updater.buildSnapshotSyncScript({ installDir: INSTALL_DIR, pkgPath }), 'utf8');
-  writeFileSync(scriptPath, updater.buildApplyScript({
-    root: INSTALL_DIR,
-    stage: stageDir,
-    backup,
-    pkg: pkgPath,
-    syncScript: syncScriptPath,
-    nodeExe: process.execPath,
-    oldPid: process.pid,
-  }), 'utf8');
-
-  const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
-    detached: true, stdio: 'ignore', windowsHide: true,
+  // A matching digest proves bytes, not plugin identity or runnable contents.
+  updater.validatePackage(readZipEntries(bytes), {
+    id: 'trae-bridge', version: info.latest, currentVersion: info.current,
+    required: ['node/adapters.cjs', 'node/update.cjs', 'node/trae.cjs'],
   });
+
+  const stageDir = mkdtempSync(join(UPDATE_DIR, 'stage-'));
+  // Unique paths also isolate concurrent update attempts and stale staging files.
+  const scriptPath = `${stageDir}.ps1`;
+  const syncScriptPath = `${stageDir}.cjs`;
+  const packagePath = `${stageDir}.cindy`;
+  const backup = `${INSTALL_DIR}.bak-${info.current}`;
+  let child;
+  try {
+    writeFileSync(packagePath, bytes);
+    extractZipTo(bytes, stageDir);
+    writeFileSync(syncScriptPath, updater.buildSnapshotSyncScript({ installDir: INSTALL_DIR, pkgPath: packagePath }), 'utf8');
+    writeFileSync(scriptPath, updater.buildApplyScript({
+      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath,
+      syncScript: syncScriptPath, nodeExe: process.execPath, oldPid: process.pid,
+    }), 'utf8');
+    child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+      detached: true, stdio: 'ignore', windowsHide: true,
+    });
+    await updater.waitForSpawn(child);
+  } catch (e) {
+    rmSync(stageDir, { recursive: true, force: true });
+    for (const file of [packagePath, scriptPath, syncScriptPath]) rmSync(file, { force: true });
+    throw new Error(`无法启动更新安装：${e.message}`);
+  }
   child.unref();
 
   // 光交给脚本还不够：脚本里的 Wait-Process 得等到本进程真的退出才动文件。
@@ -1264,7 +1286,7 @@ async function applyUpdate() {
     applied: true,
     backup,
     scriptPath,
-    message: `已下载 ${info.latest} 并交给后台脚本替换；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
+    message: `已下载 ${info.latest} 并成功启动后台安装脚本；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
   };
 }
 

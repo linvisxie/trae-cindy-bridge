@@ -214,9 +214,20 @@
     setTimeout(() => { btn.textContent = '签到'; load(); }, 2500);
   });
 
+  // 更新按钮只有一个处理器、按 updateMode 分支：以前在处理器里再赋 btn.onclick，
+  // 两个处理器不会互相注销，「安装」态点一次会把检查和安装同时发出去并发跑。
+  let updateMode = 'check';
   $('checkUpdate').addEventListener('click', async () => {
     const btn = $('checkUpdate');
     const msg = $('updateMsg');
+    if (updateMode === 'install') {
+      btn.disabled = true; btn.textContent = '安装中…';
+      const a = await ask('applyUpdate', 120000);
+      msg.textContent = (a && (a.message || a.error)) || '没拿到结果';
+      btn.disabled = false; btn.textContent = '检查更新';
+      updateMode = 'check';
+      return;
+    }
     btn.disabled = true; btn.textContent = '检查中…';
     const r = await ask('checkUpdate', 30000);
     btn.disabled = false; btn.textContent = '检查更新';
@@ -233,12 +244,7 @@
     // 有新版本就把按钮变成「安装」，点第二次才真的下 —— 装完进程会退出重启，不该被误触。
     msg.textContent = `发现新版本 ${r.latest}（当前 ${r.current}）。点「安装」由后台脚本替换，约 30 秒后生效。`;
     btn.textContent = '安装';
-    btn.onclick = async () => {
-      btn.disabled = true; btn.textContent = '安装中…';
-      const a = await ask('applyUpdate', 120000);
-      msg.textContent = (a && (a.message || a.error)) || '没拿到结果';
-      btn.disabled = false;
-    };
+    updateMode = 'install';
   });
 
   load();

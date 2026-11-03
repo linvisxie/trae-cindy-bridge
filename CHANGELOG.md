@@ -4,6 +4,22 @@
 
 ---
 
+## 0.1.7
+
+**2026-11-03** · 面板与插件描述写全三套协议
+
+### 改了什么
+
+1. **面板「在 Cindy 里接入」不再只写 OpenAI 一种协议**。现在列出 Chat Completions / Responses / Anthropic Messages 三选一，并说明 Responses 保留 Base URL 末尾的 `/v1`、Anthropic 用同一个 Base URL 与同一个 API Key。三套协议本来就都实现了（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`），只是面板文案一直停在最早那一版。
+2. **`ghost.json` 的 `description` / `whenToUse` 重写**。说明起的是三协议本地端点、模型 ID 与实测上下文窗口由插件自己公布；适用场景补上「问该选哪个协议」「问上下文窗口填多少」「问能不能画图」「问有没有新版本」。
+3. **发布清单与描述对齐**。`releaseNotes` 里点明文生图与自查更新两项能力，不再只有最早那版的三句话。
+
+### 为什么值得单独发一版
+
+Cindy 的「插件管理」页展示的是插件清单快照（`ghost-install-state/_ns/_root/<id>.json` 里的 `manifest`），只覆盖运行文件不会刷新它 —— 于是会出现「代码是新的、管理页还写 v0.1.0、Tools 还是旧的」。这一版把清单一起重写，安装脚本同时更新快照与 `packageSha256`，管理页才对得上。
+
+---
+
 ## 0.1.6
 
 **2026-11-03** · 补齐三条以前写在「已知限制」里的能力：token 自动续期、文生图、自查更新

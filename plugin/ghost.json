@@ -2,12 +2,12 @@
   "schemaVersion": 3,
   "id": "trae-bridge",
   "name": "Trae 桥",
-  "version": "0.1.6",
-  "releaseNotes": "新增三件事：① token 自动续期 —— 用 Trae 自己的 ExchangeToken 接口（DeviceProof 用 storage.json 里的 EC 私钥签），凭据快到期时提前换、对话撞上 401 时也当场换一次再重试，过期不必再手工重登；② 文生图 —— 新工具 trae_draw_image，走 Trae 的 tool_text_to_image + get_resource_url 两步，图片落到数据目录 images/ 下；③ 自查更新 —— 面板「检查更新」按钮与新工具 trae_update，从 GitHub Releases 拉最新 .cindy，交给独立脚本在本进程退出后替换（Windows 上不能自己覆盖自己）。",
+  "version": "0.1.7",
+  "releaseNotes": "0.1.7：面板与描述文案写全三套协议（Chat Completions / Responses / Anthropic Messages），补上文生图与检查更新两项能力说明。",
   "minCindyVersion": "0.1.119",
   "author": "linvis",
-  "description": "读取本机 Trae CN 客户端的登录状态，在本机起一个 OpenAI / Anthropic 兼容接口，供 Cindy 的「自定义供应商」指向。不修改 Cindy 任何文件，也不会替你填供应商配置。",
-  "whenToUse": "用户想在 Cindy 里用 Trae 的模型时；用户问 Trae 桥的地址、状态、模型数或额度积分时；用户说 Trae 登录过期、要重新登录时；用户说要 Trae 每日签到领积分时。",
+  "description": "读取本机 Trae CN 客户端的登录状态，在本机 127.0.0.1:47822 起一个本地端点，同时支持三套协议：OpenAI Chat Completions、OpenAI Responses、Anthropic Messages，另带文生图。Cindy 的「自定义供应商」选任一协议都能直接指向它，模型 ID、实测上下文窗口、倍率都由插件自己公布。不修改 Cindy 任何文件，也不会替你填供应商配置。",
+  "whenToUse": "用户想在 Cindy 里用 Trae 的模型时；用户问 Trae 桥的地址、状态、模型数或额度积分时；用户问该选哪个协议、Responses 或 Anthropic 能不能用、上下文窗口填多少时；用户说 Trae 登录过期、要重新登录时；用户要 Trae 每日签到领积分、要画图、或问插件有没有新版本时。",
   "entry": "main.js",
   "launch": "resident",
   "command": "trae",
@@ -68,7 +68,9 @@
             "description": "可选尺寸，形如 1024x1024 的总像素必须落在 3686400~16777216 之间，也可以传预设 2k / 3k / 4k / square / square_hd / landscape / portrait。不传默认 1920x1920（总像素 3686400，正好卡在下限）。"
           }
         },
-        "required": ["prompt"],
+        "required": [
+          "prompt"
+        ],
         "additionalProperties": false
       }
     },
@@ -80,7 +82,10 @@
         "properties": {
           "action": {
             "type": "string",
-            "enum": ["check", "apply"],
+            "enum": [
+              "check",
+              "apply"
+            ],
             "description": "check=只检查（默认），apply=下载并安装。"
           }
         },

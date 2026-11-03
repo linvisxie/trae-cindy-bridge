@@ -10,15 +10,20 @@ const SRC = join(__dirname, '..');
 const OUT_DIR = join(__dirname, '..', '..', 'dist');
 const OUT = join(OUT_DIR, 'trae-cindy-bridge.cindy');
 
-// 要打进包的文件（顺序固定，保证可复现）
+// 要打进包的文件（顺序固定，保证可复现）。from 是相对 plugin/ 的路径，
+// name 是包内路径 —— 许可与第三方声明放在仓库根，得用 ../ 取，但包内必须落到根部。
 const FILES = [
-  'ghost.json',
-  'main.js',
-  'panel.html',
-  'panel.js',
-  'node/worker.cjs',
-  'node/adapters.cjs',
-  'node/trae.cjs',
+  { from: 'ghost.json', name: 'ghost.json' },
+  { from: 'main.js', name: 'main.js' },
+  { from: 'panel.html', name: 'panel.html' },
+  { from: 'panel.js', name: 'panel.js' },
+  { from: 'node/worker.cjs', name: 'node/worker.cjs' },
+  { from: 'node/adapters.cjs', name: 'node/adapters.cjs' },
+  { from: 'node/trae.cjs', name: 'node/trae.cjs' },
+  // MIT 要求分发时随附许可与版权声明，跑到别人机器上的 .cindy 才是真正的「分发」。
+  { from: '../LICENSE', name: 'LICENSE' },
+  { from: '../NOTICE', name: 'NOTICE' },
+  { from: '../THIRD-PARTY-NOTICES.md', name: 'THIRD-PARTY-NOTICES.md' },
 ];
 
 const CRC_TABLE = (() => {
@@ -113,18 +118,19 @@ function buildZip(entries) {
 
 function main() {
   // 包体自检：manifest 能否解析、入口文件是否存在
+  const referenced = new Set(FILES.map((f) => f.from));
   const manifest = JSON.parse(readFileSync(join(SRC, 'ghost.json'), 'utf8'));
   if (manifest.schemaVersion !== 3) throw new Error('schemaVersion 必须是 3');
   if (!manifest.minCindyVersion) throw new Error('schemaVersion 3 必须声明 minCindyVersion');
-  if (manifest.node && !FILES.includes(manifest.node.entry)) throw new Error('node.entry 不在打包清单里');
-  if (manifest.entry && !FILES.includes(manifest.entry)) throw new Error('entry 不在打包清单里');
-  if (manifest.panel && !FILES.includes(manifest.panel.html)) throw new Error('panel.html 不在打包清单里');
+  if (manifest.node && !referenced.has(manifest.node.entry)) throw new Error('node.entry 不在打包清单里');
+  if (manifest.entry && !referenced.has(manifest.entry)) throw new Error('entry 不在打包清单里');
+  if (manifest.panel && !referenced.has(manifest.panel.html)) throw new Error('panel.html 不在打包清单里');
 
   const entries = [];
-  for (const rel of FILES) {
-    const abs = join(SRC, rel);
-    if (!statSync(abs).isFile()) throw new Error(`不是文件：${rel}`);
-    entries.push({ name: rel, data: readFileSync(abs) });
+  for (const f of FILES) {
+    const abs = join(SRC, f.from);
+    if (!statSync(abs).isFile()) throw new Error(`不是文件：${f.from}`);
+    entries.push({ name: f.name, data: readFileSync(abs) });
   }
 
   const zip = buildZip(entries);

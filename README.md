@@ -393,7 +393,7 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 
 ## 开发与测试
 
-`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Trae CN**（要真读登录态、真打上游）；`host-guard`、`responses-status`、`e2e-package` 是纯本地的。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
+`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Trae CN**（要真读登录态、真打上游）；`host-guard`、`responses-status`、`upstream-contract` 是纯本地的。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
 
 额度耗尽（上游回 `4008`）时，所有需要上游 200 的用例会自动降级成 `SKIP` 而不是 `FAIL` —— 那是账号状态，不是代码回归。
 
@@ -403,7 +403,8 @@ cd plugin && npm run pack       :: 打包
 
 node test\host-guard.js         :: Host 守卫 13 项（纯本地，不需要登录）
 node test\responses-status.js   :: Responses 状态映射 19 项（纯本地，不需要登录）
-node test\e2e-package.js        :: 包端到端 18-21 项（解包 → 起 worker → 真对话 → 三条协议）
+node test\upstream-contract.js  :: 上游契约 16 项（纯本地：交错工具分片 / 截断判定 / usage 回传）
+node test\e2e-package.js        :: 包端到端 24 项（解包 → 起 worker → 真对话 → 三条协议 → 许可文件）
 node test\e2e-panel.js          :: 面板脚本 17 项
 node test\e2e-brain.js          :: 面板 ↔ 电子脑真实总线 13 项
 node test\smoke-protocols.js    :: 三条协议形状 19 项
@@ -415,7 +416,7 @@ node test\features.js           :: 档位 / 上下文 / 倍率 / 额度 / 错误
 想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `deepseek-v4.1-flash`）。
 每个测试自己开临时目录与独立端口，不会踩到正在跑的实例。
 
-**为什么这些测试长这样**：它们都在防具体的线上事故 —— `host-guard` 防 Cindy 的代理转发时把 Host 头改成不带端口（那会让 claude-code 引擎 403）；`wire-quirks` 防 Base URL 带 `/v1` 被叠成 `/v1/v1/messages`、以及上下文选 1M 时 Cindy 把模型 id 编成 `deepseek-v4.1-flash[1m]`；`e2e-brain` 防 `cindy.node.request` 的双层信封只剥一层（那会让面板显示「未登录 / 0 个 / —」）；`responses-status` 防 Responses 被截断或内容策略掐断时顶层与子项状态各说各话，也钉死「子项 status 只能是 `in_progress` / `completed` / `incomplete`」——`failed` 只属于顶层 `Response`；`features` 里那几条窗口与档位断言，防的是「把 `prompt_max_tokens` 当窗口」「给纯 chat 模型编造倍率与档位」。
+**为什么这些测试长这样**：它们都在防具体的线上事故 —— `host-guard` 防 Cindy 的代理转发时把 Host 头改成不带端口（那会让 claude-code 引擎 403）；`wire-quirks` 防 Base URL 带 `/v1` 被叠成 `/v1/v1/messages`、以及上下文选 1M 时 Cindy 把模型 id 编成 `deepseek-v4.1-flash[1m]`；`e2e-brain` 防 `cindy.node.request` 的双层信封只剥一层（那会让面板显示「未登录 / 0 个 / —」）；`responses-status` 防 Responses 被截断或内容策略掐断时顶层与子项状态各说各话，也钉死「子项 status 只能是 `in_progress` / `completed` / `incomplete`」——`failed` 只属于顶层 `Response`；`upstream-contract` 防的是交错工具分片被拆成空名字的块、上游断流时半截回答被当完整、以及两路适配器吞掉真实 usage；`features` 里那几条窗口与档位断言，防的是「把 `prompt_max_tokens` 当窗口」「给纯 chat 模型编造倍率与档位」。
 
 ## 本地端点
 

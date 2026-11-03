@@ -620,9 +620,14 @@ function traeFailureOf(decoded) {
   };
 }
 
+// 上游码 → 本地 HTTP 语义。额度耗尽/会员相关给 402，临时性服务端缺口给 503，
+// 这样调用方看到 402 就知道「不是我这边的错，是账号额度」，不会被误导去重试或重登录。
 function statusOfTraeCode(code) {
-  if (code === 1005) return 402;
-  if (code === 4011) return 429;
+  if (code === 1005) return 402;   // 需要付费套餐
+  if (code === 4008) return 402;   // SOLO 额度耗尽
+  if (code === 4222) return 402;   // 企业租户额度耗尽
+  if (code === 4011) return 429;   // 限流
+  if (code === 2001) return 503;   // 服务端没发布该 function config，临时缺口
   return 400;
 }
 
@@ -673,16 +678,20 @@ function normalizeToolCalls(list) {
 
 const PEEK_MAX_CHUNKS = 64;
 const PEEK_MAX_BYTES = 262144;
+// 上游挂了不返回、TCP 半开时，光靠调用方传进来的 signal 是等不到东西的
+// （那个 signal 只在客户端断开时才 abort）。这里补一个总超时，与 qoder 桥一致。
+const CHAT_TIMEOUT_MS = 180000;
 
 async function* streamChat(credential, identity, request, signal) {
   const model = typeof request.model === 'string' && request.model ? request.model : 'glm-5.2';
   const body = prepareSoloBody(request);
+  const timeout = AbortSignal.timeout(CHAT_TIMEOUT_MS);
 
   const res = await fetch(`${CHAT_BASE}${CHAT_PATH}`, {
     method: 'POST',
     headers: buildHeaders(credential, identity, 'chat'),
     body: JSON.stringify(body),
-    signal,
+    signal: signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
   });
 
   if (!res.ok) {
@@ -713,6 +722,7 @@ async function* streamChat(credential, identity, request, signal) {
   const textDecoder = new TextDecoder();
   const sse = new SseDecoder();
 
+  try {
   // Trae 把鉴权/额度/限流失败塞进 HTTP 200 的 SSE 里，直接 200 转发再断流会让客户端
   // 误判成网络故障并重试。所以先偷看头部若干帧，发现早期失败就翻成真错误抛出去。
   let peekChunks = 0;
@@ -809,7 +819,19 @@ async function* streamChat(credential, identity, request, signal) {
       if (finished) break;
     }
   }
-  if (!finished) yield chunk({}, sawToolCalls ? 'tool_calls' : 'stop', usage);
+  // 以前这里自作主张补一帧 stop：上游断流没给 done 也当成正常说完，
+  // 半截文本、半截工具参数会被原样交出去。现在改成明确的截断错误，让上层决定怎么报。
+  if (!finished) {
+    const err = new Error('Trae 在结束信号到达前就断开了连接，这次回答不完整');
+    err.status = 502;
+    err.upstreamCode = 'upstream_truncated';
+    throw err;
+  }
+  } finally {
+    // 客户端中途断开、或提前报错时，这条流还挂在连接上读，必须主动取消，
+    // 否则一条泄漏的 reader 会一直占着上游连接直到超时。
+    try { await reader.cancel(); } catch {}
+  }
 }
 
 // ============================================================

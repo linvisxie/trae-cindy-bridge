@@ -4,6 +4,32 @@
 
 ---
 
+## 0.1.5
+
+**2026-11-03** · 修代码审查（issue #1）报的 7 项
+
+### 修了什么
+
+1. **并行工具调用被拆坏**（P1）。上游把两次工具调用的分片交错着发：首帧 A/B 各带 id 和半截参数，次帧只带参数增量、`name` 是空串。旧实现的 `writeAnthropicStream` 见到新 index 就 `closeOpen()` 把已开的块全关掉，结果是 4 个 `tool_use` 块、后两个名字是空。现在按上游 index 独立累计 id/name/arguments，整轮读完再逐个吐完整块；文本仍照常流式。
+2. **缺结束信号就 EOF 被当成正常说完**（P1）。只吐一段文本然后断流、既没有 `finish_reason` 也没有结束事件时，旧实现照常收尾，半截回答会被当完整结果交给 Cindy。现在四个出口（Anthropic 流/非流、Responses 流/非流）都要求见到明确结束信号，否则抛「上游在结束信号到达前就断开了连接」。
+3. **下游断开不取消上游**（P2）。原先只听 `req` 的 `close`，但客户端断开时请求流往往已经 end 过、事件早发完了。现在同时听 `res` 的 `close`，且只在 `!res.writableEnded` 时 abort；正常结束时摘掉监听。
+4. **Anthropic / Responses 两路本地账本漏记输出 token**（P2）。之前无论上游给不给 usage，这两路都固定记 `输出 = 0`。现在适配器把真实 usage 回传，worker 优先记真实值，缺失才当 0。
+5. **上游明确的 4xx/5xx 被一律盖成 502**（P2）。`errorStatusOf()` 先看能不能排队重试（→503），再看 `err.status` 是不是合法 4xx/5xx（照原样透出），实在分不清才 502。`trae.cjs` 的 `statusOfTraeCode` 补上 `4008/4222 → 402`（额度耗尽）、`2001 → 503`（服务端临时缺口），`humanizeUpstreamError` 的 `1005` 分支不再抢 `status === 402`，免得把额度用尽说成「需要付费套餐」。
+6. **.cindy 包里没有许可与第三方声明**（P2）。MIT 要求分发时随附许可与版权声明，而装到别人机器上的包才算真分发。`pack.cjs` 的清单改成 `{from, name}` 结构，从仓库根一并打进 `LICENSE` / `NOTICE` / `THIRD-PARTY-NOTICES.md`。
+7. **模型缓存二次归一化**（P1）。`models.json` 里存的是已经 `normalizeModel` 过的对象，无凭据分支读缓存时又 `.map(normalizeModel)`，把 `key` / `effortLevels` / `priceFactor` 全抹成 `undefined`，表现为模型名变成 `undefined`、档位消失、倍率丢失。现在读缓存直接用。
+
+### 另外
+
+- `trae.cjs` 的上游请求补 180 秒总超时（与 qoder 桥一致）；流 reader 用 `finally` 主动 `cancel()`，不再留悬挂连接。
+- 新增 `test/upstream-contract.js`：把上面第 1、2、4 项做成纯离线回归（交错分片、四种出口的截断判定、usage 回传），不需要登录态和额度。
+- `test/e2e-package.js` 增加三条断言：包里必须含 `LICENSE`、`NOTICE`、`THIRD-PARTY-NOTICES.md`。
+
+### 测试
+
+`features 51/0`、`host-guard 13/0`、`responses-status 19/0`、`upstream-contract 16/0`、`smoke-protocols 19/0`、`smoke-tools 11/0`、`wire-quirks 10/0`、`e2e-package 24/0`、`e2e-panel 17/17`、`e2e-brain 13/13`、`verify-manifest PASS`。
+
+---
+
 ## 0.1.4
 
 **2026-11-02** · 修「未登录 / 发不出消息」—— 选错了凭据文件

@@ -129,7 +129,9 @@ async function refreshModels(force) {
   const cache = join(DATA_DIR, 'models.json');
   const cred = await refreshCredential(force);
   if (!cred) {
-    try { models = JSON.parse(readFileSync(cache, 'utf8')).map(normalizeModel); } catch {}
+    // models.json 里存的已经是 normalizeModel 之后的对象（写盘时就是 models 本身），
+    // 这里再 map 一遍就会把 key/effortLevels/priceFactor 全部抹成 undefined。
+    try { models = JSON.parse(readFileSync(cache, 'utf8')); } catch {}
     return models;
   }
   try {
@@ -374,7 +376,9 @@ function humanizeUpstreamError(err) {
   const detail = raw.slice(0, 500);
   const pick = (msg, extra) => ({ message: msg, detail, ...(extra || {}) });
 
-  if (code === '1005' || status === 402) {
+  // 先按上游码判，再按 status 兜底：4008/4222 现在都映射成 402，
+  // 若先判 status===402 就会被「需要付费套餐（1005）」的文案吞掉，说错原因。
+  if (code === '1005') {
     return pick('Trae 要求付费套餐才能用这个模型（1005）。在 Trae 里升级套餐，或者换一个免费模型。', { type: 'hard_credit' });
   }
   if (code === '2001') {
@@ -403,6 +407,9 @@ function humanizeUpstreamError(err) {
   }
   if (code === '3003') {
     return pick('这个模型当前账号没有可用通道（3003 = all models failed）。不是网络问题、不用挂代理，换个模型就行。', { type: 'client' });
+  }
+  if (code === 'upstream_truncated') {
+    return pick('Trae 在说完之前就断流了，这次回答不完整。直接重发一次通常就好。', { type: 'upstream_error' });
   }
   if (status === 401 || status === 403) {
     return pick('Trae 不认当前凭证了：打开 Trae CN 客户端重新登录，然后回来点面板上的「刷新」。', { type: 'auth_expired' });
@@ -618,6 +625,50 @@ function resolveEntry(displayModel) {
     || models.find((m) => m.key.toLowerCase() === String(displayModel).toLowerCase());
 }
 
+// 下游挂断要能中断上游。只管 req 的 'close' 是不够的：Node 里 req 是请求流，
+// 客户端断开时它常已读完并 end，'close' 早发过了；真正可靠的是 res 的 'close'。
+// 同时正常结束时必须把监听摘掉，否则连接复用时会被上一次的监听误伤。
+function bindAbort(req, res, controller) {
+  const onClose = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  req.on('close', onClose);
+  res.on('close', onClose);
+  let done = false;
+  return {
+    done() {
+      if (done) return;
+      done = true;
+      req.removeListener('close', onClose);
+      res.removeListener('close', onClose);
+    },
+  };
+}
+
+// 上游已经把错误分好类了，别再用一个 502 把它抹平：
+// 401/403 该让客户端重新登录，402 该提示付费/额度，429 该退避重试。
+// 只有确实无从判断的才退回 502，排队没等到位置的仍是 503。
+function errorStatusOf(e) {
+  const queued = queueWaitMs(e);
+  if (queued !== undefined) return 503;
+  const s = Number(e?.status);
+  if (Number.isInteger(s) && s >= 400 && s <= 599) return s;
+  return 502;
+}
+
+function errorBodyOf(e) {
+  const queued = queueWaitMs(e);
+  const nice = humanizeUpstreamError(e);
+  return {
+    error: {
+      message: nice.message,
+      type: nice.type ?? (queued === undefined ? 'upstream_error' : 'rate_limit'),
+      detail: nice.detail,
+      ...(queued === undefined ? {} : { retry_after_seconds: Math.ceil(queued / 1000) }),
+    },
+  };
+}
+
 async function chatCompletions(req, res) {
   const parsed = await readJsonBody(req, res);
   if (!parsed.ok) return;
@@ -656,7 +707,7 @@ async function chatCompletions(req, res) {
 
   const wantStream = payload.stream !== false;
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  const cancelOnClose = bindAbort(req, res, controller);
 
   let iterator, first;
   try {
@@ -675,17 +726,9 @@ async function chatCompletions(req, res) {
       }
     }
   } catch (e) {
+    cancelOnClose.done();
     log('对话失败', displayModel, e.message.slice(0, 200));
-    const queued = queueWaitMs(e);
-    const nice = humanizeUpstreamError(e);
-    sendJson(res, queued === undefined ? 502 : 503, {
-      error: {
-        message: nice.message,
-        type: nice.type ?? (queued === undefined ? 'upstream_error' : 'rate_limit'),
-        detail: nice.detail,
-        ...(queued === undefined ? {} : { retry_after_seconds: Math.ceil(queued / 1000) }),
-      },
-    });
+    sendJson(res, errorStatusOf(e), errorBodyOf(e));
     return;
   }
 
@@ -719,6 +762,7 @@ async function chatCompletions(req, res) {
       choices: [{ index: 0, message, finish_reason: finish }],
       ...(usage !== undefined ? { usage } : {}),
     });
+    cancelOnClose.done();
     return;
   }
 
@@ -758,11 +802,13 @@ async function chatCompletions(req, res) {
     res.write('data: [DONE]\n\n');
     res.end();
     recordUsage(entry || { model: displayModel }, 'chat', streamUsage?.prompt_tokens, streamUsage?.completion_tokens);
+    cancelOnClose.done();
     return;
   }
   res.write('data: [DONE]\n\n');
   res.end();
   recordUsage(entry || { model: displayModel }, 'chat', streamUsage?.prompt_tokens, streamUsage?.completion_tokens);
+  cancelOnClose.done();
 }
 
 function notSignedInMessage() {
@@ -776,7 +822,7 @@ async function openUpstream(req, res, request, displayModel) {
   if (!cred) { sendJson(res, 401, { error: { message: notSignedInMessage() } }); return { ok: false }; }
 
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  const cancelOnClose = bindAbort(req, res, controller);
 
   let iterator, first;
   try {
@@ -795,20 +841,12 @@ async function openUpstream(req, res, request, displayModel) {
       }
     }
   } catch (e) {
+    cancelOnClose.done();
     log('对话失败', displayModel, e.message.slice(0, 200));
-    const queued = queueWaitMs(e);
-    const nice = humanizeUpstreamError(e);
-    sendJson(res, queued === undefined ? 502 : 503, {
-      error: {
-        message: nice.message,
-        type: nice.type ?? (queued === undefined ? 'upstream_error' : 'rate_limit'),
-        detail: nice.detail,
-        ...(queued === undefined ? {} : { retry_after_seconds: Math.ceil(queued / 1000) }),
-      },
-    });
+    sendJson(res, errorStatusOf(e), errorBodyOf(e));
     return { ok: false };
   }
-  return { ok: true, iterator, first };
+  return { ok: true, iterator, first, cancelOnClose };
 }
 
 async function anthropicMessages(req, res) {
@@ -850,9 +888,15 @@ async function anthropicMessages(req, res) {
   if (!up.ok) return;
 
   const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
-  if (chat.stream) await adapters.writeAnthropicStream(res, up.first, up.iterator, opts);
-  else sendJson(res, 200, await adapters.anthropicMessage(up.first, up.iterator, opts));
-  recordUsage(entry || { model: displayModel }, 'anthropic', opts.inputTokens, 0);
+  try {
+    if (chat.stream) await adapters.writeAnthropicStream(res, up.first, up.iterator, opts);
+    else sendJson(res, 200, await adapters.anthropicMessage(up.first, up.iterator, opts));
+  } finally {
+    up.cancelOnClose.done();
+    // 上游给了真实 usage 就用真实的，没给才退回估算；输出侧以前写死 0，账本里永远是 0 token。
+    const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
+    recordUsage(entry || { model: displayModel }, 'anthropic', opts.inputTokens, out);
+  }
 }
 
 async function openaiResponses(req, res) {
@@ -895,9 +939,14 @@ async function openaiResponses(req, res) {
   if (!up.ok) return;
 
   const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
-  if (chat.stream) await adapters.writeResponsesStream(res, up.first, up.iterator, opts);
-  else sendJson(res, 200, await adapters.responsesMessage(up.first, up.iterator, opts));
-  recordUsage(entry || { model: displayModel }, 'responses', opts.inputTokens, 0);
+  try {
+    if (chat.stream) await adapters.writeResponsesStream(res, up.first, up.iterator, opts);
+    else sendJson(res, 200, await adapters.responsesMessage(up.first, up.iterator, opts));
+  } finally {
+    up.cancelOnClose.done();
+    const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
+    recordUsage(entry || { model: displayModel }, 'responses', opts.inputTokens, out);
+  }
 }
 
 function listenOn(port) {

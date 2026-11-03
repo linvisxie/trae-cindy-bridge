@@ -44,6 +44,12 @@ for (const rel of MUST) {
   if (existsSync(join(work, rel))) ok(`包含 ${rel}`);
   else bad(`缺少 ${rel}`);
 }
+
+// MIT 要求分发时随附许可与版权声明。.cindy 会跑到别人机器上，那就算分发。
+for (const rel of ['LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md']) {
+  if (existsSync(join(work, rel))) ok(`包含 ${rel}（许可与第三方声明）`);
+  else bad(`缺少 ${rel}：MIT 要求分发时随附许可与版权声明`);
+}
 if (!existsSync(join(work, 'ghost.json'))) process.exit(1);
 
 let manifest;
@@ -169,8 +175,9 @@ function rpc(method, timeoutMs = 60000) {
           body: JSON.stringify({ model: model.id, max_tokens: 32, stream: false, messages: [{ role: 'user', content: '只回答两个字：收到' }] }),
           signal: AbortSignal.timeout(90000),
         });
-        const body = r.status === 200 ? '' : await r.text();
-        const j = r.status === 200 ? JSON.parse(body || '{}') : null;
+        const body = await r.text();
+        let j = null;
+        try { j = r.status === 200 ? JSON.parse(body || '{}') : null; } catch (e) { bad('/v1/messages 回的 JSON 解析失败：' + e.message); }
         if (j && j.type === 'message') ok('/v1/messages 可用（Anthropic 协议）');
         else if (isQuota(r.status, body)) skip(`/v1/messages HTTP ${r.status}（4008 额度耗尽，账号状态非回归）`);
         else bad('/v1/messages HTTP ' + r.status + ' ' + body.slice(0, 160));

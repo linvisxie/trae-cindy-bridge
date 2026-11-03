@@ -8,10 +8,10 @@ const zlib = require('node:zlib');
 
 const SRC = join(__dirname, '..');
 const OUT_DIR = join(__dirname, '..', '..', 'dist');
-const OUT = join(OUT_DIR, 'cindy-qoder-bridge.cindy');
+const OUT = join(OUT_DIR, 'trae-cindy-bridge.cindy');
 
-// 要打进包的文件（顺序固定，保证可复现）。from 是相对 plugin/ 的读取路径，
-// name 是包内路径——仓库根的三份声明必须落在包根，不能带 ../。
+// 要打进包的文件（顺序固定，保证可复现）。from 是相对 plugin/ 的路径，
+// name 是包内路径 —— 许可与第三方声明放在仓库根，得用 ../ 取，但包内必须落到根部。
 const FILES = [
   { from: 'ghost.json', name: 'ghost.json' },
   { from: 'main.js', name: 'main.js' },
@@ -20,6 +20,7 @@ const FILES = [
   { from: 'node/worker.cjs', name: 'node/worker.cjs' },
   { from: 'node/adapters.cjs', name: 'node/adapters.cjs' },
   { from: 'node/update.cjs', name: 'node/update.cjs' },
+  { from: 'node/trae.cjs', name: 'node/trae.cjs' },
   // MIT 要求分发时随附许可与版权声明，跑到别人机器上的 .cindy 才是真正的「分发」。
   { from: '../LICENSE', name: 'LICENSE' },
   { from: '../NOTICE', name: 'NOTICE' },
@@ -42,13 +43,9 @@ function crc32(buf) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-// 时间戳必须用 UTC 分量编码，不能用本地时间。
-// 踩过的坑：固定时间戳 new Date('2026-10-29T00:00:00Z')，但 getHours() 取的是本地时区，
-// 于是同一个提交在北京打出来是 08:00、在 UTC 机器上是 00:00，两边 sha256 不同。
-// CI 的"再打一次对比"只在同一台机器上跑，发现不了这种漂移 —— 只有换机器才会露出来。
 function dosTime(d) {
-  const time = ((d.getUTCHours() & 0x1f) << 11) | ((d.getUTCMinutes() & 0x3f) << 5) | ((d.getUTCSeconds() / 2) & 0x1f);
-  const date = (((d.getUTCFullYear() - 1980) & 0x7f) << 9) | (((d.getUTCMonth() + 1) & 0x0f) << 5) | (d.getUTCDate() & 0x1f);
+  const time = ((d.getHours() & 0x1f) << 11) | ((d.getMinutes() & 0x3f) << 5) | ((d.getSeconds() / 2) & 0x1f);
+  const date = (((d.getFullYear() - 1980) & 0x7f) << 9) | (((d.getMonth() + 1) & 0x0f) << 5) | (d.getDate() & 0x1f);
   return { time, date };
 }
 
@@ -122,10 +119,10 @@ function buildZip(entries) {
 
 function main() {
   // 包体自检：manifest 能否解析、入口文件是否存在
+  const referenced = new Set(FILES.map((f) => f.from));
   const manifest = JSON.parse(readFileSync(join(SRC, 'ghost.json'), 'utf8'));
   if (manifest.schemaVersion !== 3) throw new Error('schemaVersion 必须是 3');
   if (!manifest.minCindyVersion) throw new Error('schemaVersion 3 必须声明 minCindyVersion');
-  const referenced = new Set(FILES.map((f) => f.from));
   if (manifest.node && !referenced.has(manifest.node.entry)) throw new Error('node.entry 不在打包清单里');
   if (manifest.entry && !referenced.has(manifest.entry)) throw new Error('entry 不在打包清单里');
   if (manifest.panel && !referenced.has(manifest.panel.html)) throw new Error('panel.html 不在打包清单里');

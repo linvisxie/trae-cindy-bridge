@@ -810,14 +810,14 @@ async function* streamChat(credential, identity, request, signal) {
         prompt_tokens: decoded.inputTokens,
         completion_tokens: decoded.outputTokens,
         total_tokens: decoded.totalTokens,
-        ...(decoded.cacheReadTokens || decoded.cacheWriteTokens
-          ? {
-            prompt_tokens_details: {
-              ...(decoded.cacheReadTokens ? { cached_tokens: decoded.cacheReadTokens } : {}),
-              ...(decoded.cacheWriteTokens ? { cache_write_tokens: decoded.cacheWriteTokens } : {}),
-            },
-          }
-          : {}),
+        // 两个缓存字段无条件带上。别只在非零时才写：Cindy 判一条 usage 是否「完整」
+        // 靠 hasOwnProperty，缺字段会让那一轮被当成未结算。虽然 Cindy 的
+        // parseChunkUsage 用 ??0 兜底不会崩，但「时有时无」的字段形状会让
+        // 排查时没法定调，也对不上 Anthropic / Responses 两路的行为。
+        prompt_tokens_details: {
+          cached_tokens: decoded.cacheReadTokens || 0,
+          cache_write_tokens: decoded.cacheWriteTokens || 0,
+        },
       };
       return;
     }

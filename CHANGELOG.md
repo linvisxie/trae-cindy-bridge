@@ -4,6 +4,56 @@
 
 ---
 
+## 0.1.11
+
+**2026-11-04** · 修缓存命中率被算低（缓存 token 被算了两遍）
+
+### 现象
+
+「缓存拆分」那一行能看到读数，但命中率明显偏低。缓存实际上并没有那么差，是我们的映射问题。
+
+### 原因
+
+Cindy 算命中率用的是（见 `app.asar` 里的 `sI()`）：
+
+```
+命中率 = cacheRead / (input_tokens + cacheRead + cacheWrite)
+```
+
+两套协议的 `input_tokens` 语义不一样：
+
+| 协议 | 含义 |
+| --- | --- |
+| OpenAI | `prompt_tokens` = 输入**总量**，已经包含命中缓存的部分 |
+| Anthropic | `input_tokens` = 输入里**没走缓存**的净额 |
+
+旧实现把 `prompt_tokens` 直接当 `input_tokens` 发出去，同一批缓存 token 在分子和分母各算一次。
+
+### 实测证据（qoder 侧）
+
+```
+修复前：读=2355  输入=2361  → 2355/(2361+2355) = 49.94%
+修复后：读=2355  输入=6     → 2355/(6+2355)    = 99.75%  ← 真值
+```
+
+总量守恒：`6 + 2355 = 2361`，与冷启动那轮的 2361 完全一致。
+
+### 改了什么
+
+1. **`anthropicUsage` 扣除缓存**（P1）。`input_tokens = max(0, prompt_tokens - cached - write)`，夹 0 是防上游计价边界出现负数。
+2. **两个缓存字段无条件带上**（P1）。Cindy 用 `hasOwnProperty` 检查四个字段，缺一个就 `complete=false`，那一轮被当成未结算，连命中率都不显示。
+3. **Chat 路径也总是带 `prompt_tokens_details`**（P2）。以前只在缓存非零时才写这个对象，导致三条协议的 usage 字段形状不一致；Cindy 的 `parseChunkUsage` 用 `??0` 兜底不会崩，但「时有时无」让人排查时没法定调。现在三条协议形状统一。
+
+### 边界说明
+
+trae 上游**完全不提供缓存数据**。实测三次全新前缀的冷启动请求，紧接着重复同一前缀，`cache_read_input_tokens` 与 `cache_creation_input_tokens` 始终为 0。所以这个桥的命中率会一直是 0%，是数据源本身没有，不是映射问题，这一版改不了。
+
+### 测试
+
+`review-regressions` 新增 9 条断言（含「旧的 49.94% 必须不再出现」这条防回退）、37/37 通过。另：`host-guard 13/0`、`responses-status 19/0`、`upstream-contract 16/0`、`update-chain 51/0`、`feature-offline 39/0`、`features 51/0`、`e2e-package 25/0`、`e2e-panel 17/17`、`e2e-brain 13/13`、`verify-manifest PASS`。
+
+---
+
 ## 0.1.10
 
 **2026-11-04** · 修两处「数字变成 0」的假象，以及一条永不消失的红字

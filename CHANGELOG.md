@@ -4,6 +4,35 @@
 
 ---
 
+## 0.1.9
+
+**2026-11-03** · 修续期 token 被旧磁盘凭据覆盖，以及输入用量与自更新的两个假象（issue #2）
+
+### 修了什么
+
+1. **续期拿到的新 token 会被磁盘上的旧票冲掉**（P1）。这是个只在「磁盘票已过期」时才发作的状态机 bug，但发作后表现为「明明刚换到有效 token，下一个请求却 401」。复现链：`renewCredential()` 换到新 token **只写内存**（这是故意的，`storage.json` 归 Trae 客户端管，从外面改会被它 flush 覆盖）；几秒后 5 分钟缓存过期或有人强制刷新，`refreshCredential()` 重新读盘拿到**早已过期的 R0**，旧代码无条件 `credential = r.credential` 覆盖，新 token 就没了；再拿 R0 去换票，轮换过的服务端直接拒绝，于是只能报登录失效。
+
+   现在给磁盘凭据算一个指纹（`storagePath` + userId + accountName + edition + host + token + refreshToken 做 SHA-256），只有**指纹变化**（即磁盘上真的是另一份登录态）才覆盖内存并 `credentialGeneration += 1`；磁盘没变就不动内存。所以：磁盘换票 → 指纹变 → 采用；换账号 → 指纹变 → 采用；明确退出 / 读到失败 → 清空；而「同一份磁盘票 + 内存里更新的 token」→ 保留内存。
+
+2. **迟到的续期结果会写进另一个账号**（P1 相关）。换票是异步的，用户可能在等待期间重新登录换号。现在续期开始时记下当时的代次，回来时若代次已变（说明换了登录态）就丢弃结果，不写入新账号。
+
+3. **同代续期并发没合并干净**（P1 相关）。`renewing` 原来只有一个槽位，不同代次的续期会互相串。现在按代次存，同代共用一个请求，异代各走各的；清理时只在槽位仍是自己时置空，不会误清新请求。
+
+4. **输入用量记的是估算值**（P2）。同 qoder 0.1.17：优先 `usage.prompt_tokens`，缺失才估算，`??` 保留真实 0，Anthropic 流式 `message_delta` 补 `input_tokens`。
+
+5. **自更新只看摘要，不校验包的身份**（P2），以及 **安装器没启动却报 applied 并退出**（P2），修法与 qoder 0.1.17 相同（两仓库共用 `update.cjs`）：解包前校验插件 ID / 版本 / schema / 声明入口与必需运行依赖；唯一 staging 目录；`waitForSpawn()` 等 `spawn`/`error`，失败清理并保活。
+
+### 加了什么
+
+- **`test/review-regressions.js`**，22 项离线行为回归，其中续期部分覆盖：缓存过期与强制刷新后新 token 仍在、磁盘换票生效、换账号生效、退出生效、迟到续期不覆盖新登录、同代并发只换一次票。
+- `updater` 导出 `validatePackage` 与 `waitForSpawn`。
+
+### 测试
+
+`review-regressions 22/22`（新）、`update-chain 51/0`、`host-guard 13/0`、`responses-status 19/0`、`upstream-contract 16/0（1 跳过）`、`features 51/0`、`feature-offline 39/0`、`e2e-package 25/0`、`e2e-panel 17/17`、`e2e-brain 13/13`、`verify-manifest PASS`。
+
+**边界**：真实上游是否轮换 refreshToken 未在本机验证；客户端「丢弃有效内存凭据」这个状态转移是用轮换 fixture 复现并钉住的。Windows 真机覆盖升级与真实账号换票同样未验证。
+
 ## 0.1.8
 
 **2026-11-03** · 把自更新链路补成可靠的，修文生图的图片地址，加英文 README

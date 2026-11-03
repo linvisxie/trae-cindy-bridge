@@ -1102,15 +1102,24 @@ async function postWeb(path, credential, body, extraHeaders) {
   if (!res.ok) {
     throw new Error(`Trae usage endpoint ${path} returned HTTP ${res.status}`);
   }
-  return res.json().catch(() => ({}));
+  return res.json();
 }
 
 async function refreshUsage(credential) {
   const payload = await postWeb(USAGE_PATH, credential, { require_usage: true });
-  const summary = (payload && payload.usage_summary) || {};
-  const total = Number(summary.total_amount);
-  const used = Number(summary.consumed_amount);
-  const ratio = Number(summary.consumption_ratio);
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+      || payload.success === false || payload.error) throw new Error('Trae usage response is invalid');
+  const summary = payload.usage_summary;
+  const amount = summary && summary.total_amount;
+  const validAmount = (typeof amount === 'number' || (typeof amount === 'string' && amount.trim() !== ''))
+    && Number.isFinite(Number(amount)) && Number(amount) >= 0;
+  // An explicit empty entitlement list with a null summary is a no-quota response.
+  const noQuota = summary === null && Array.isArray(payload.user_entitlement_pack_list)
+    && payload.user_entitlement_pack_list.length === 0;
+  if (!validAmount && !noQuota) throw new Error('Trae usage response has no valid quota summary');
+  const total = Number(summary?.total_amount);
+  const used = Number(summary?.consumed_amount);
+  const ratio = Number(summary?.consumption_ratio);
 
   const packs = [];
   const list = Array.isArray(payload.user_entitlement_pack_list) ? payload.user_entitlement_pack_list : [];

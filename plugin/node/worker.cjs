@@ -17,6 +17,7 @@ const { readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, rename
 const { randomUUID } = require('node:crypto');
 const adapters = require('./adapters.cjs');
 const trae = require('./trae.cjs');
+const updater = require('./update.cjs');
 
 // ============================================================
 // 运行时状态
@@ -1159,21 +1160,12 @@ const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`
 const UPDATE_DIR = join(DATA_DIR, 'update');
 const INSTALL_DIR = join(__dirname, '..');
 
-function versionParts(v) {
-  return String(v || '').replace(/^v/i, '').split('.').map((x) => Number(x.replace(/\D/g, '')) || 0);
-}
-
-// 比版本：a 比 b 新返回正数，相同 0，旧负数。逐段比，缺的段按 0 算。
-function compareVersion(a, b) {
-  const x = versionParts(a);
-  const y = versionParts(b);
-  const n = Math.max(x.length, y.length);
-  for (let i = 0; i < n; i++) {
-    const d = (x[i] || 0) - (y[i] || 0);
-    if (d !== 0) return d;
-  }
-  return 0;
-}
+// 版本比较、digest 校验、zip 解包、脚本生成都在 node/update.cjs ——
+// 那一份是纯函数、可以离线跑回归测试；这里只留需要 IO 的部分。
+const versionParts = updater.versionParts;
+const compareVersion = updater.compareVersion;
+const readZipEntries = updater.readZipEntries;
+const extractZipTo = updater.extractZipTo;
 
 function currentVersion() {
   try {
@@ -1199,57 +1191,15 @@ async function checkUpdate() {
     hasUpdate: Boolean(latest) && compareVersion(latest, mine) > 0,
     htmlUrl: typeof j.html_url === 'string' ? j.html_url : '',
     notes: typeof j.body === 'string' ? j.body.slice(0, 2000) : '',
-    asset: asset ? { name: asset.name, size: asset.size, url: asset.browser_download_url } : undefined,
+    asset: asset ? {
+      name: asset.name,
+      size: asset.size,
+      url: asset.browser_download_url,
+      // GitHub 从 2025 年起在 asset 上给 digest（"sha256:…"），它就是完整性根锚，
+      // 与本机 dist 包、以及 Cindy 记的 packageSha256 三方一致。旧版本没有就退化成按 size 校验。
+      digest: typeof asset.digest === 'string' ? asset.digest : undefined,
+    } : undefined,
   };
-}
-
-// 极简 zip 读取：.cindy 就是普通 zip，只需要「列条目 + 解到目录」这一件事。
-// （test/_unzip.cjs 是同一份逻辑，但测试目录不会被打进插件包，所以这里独立一份。）
-function readZipEntries(buf) {
-  let eocd = -1;
-  const minPos = Math.max(0, buf.length - 22 - 65535);
-  for (let i = buf.length - 22; i >= minPos; i--) {
-    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
-  }
-  if (eocd < 0) throw new Error('不是有效的 zip：找不到中央目录结尾');
-  const count = buf.readUInt16LE(eocd + 10);
-  let off = buf.readUInt32LE(eocd + 16);
-  const out = [];
-  for (let n = 0; n < count; n++) {
-    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error('中央目录条目签名不对');
-    const method = buf.readUInt16LE(off + 10);
-    const compSize = buf.readUInt32LE(off + 20);
-    const nameLen = buf.readUInt16LE(off + 28);
-    const extraLen = buf.readUInt16LE(off + 30);
-    const commentLen = buf.readUInt16LE(off + 32);
-    const localOff = buf.readUInt32LE(off + 42);
-    const name = buf.toString('utf8', off + 46, off + 46 + nameLen);
-    if (buf.readUInt32LE(localOff) !== 0x04034b50) throw new Error('本地文件头签名不对：' + name);
-    const lNameLen = buf.readUInt16LE(localOff + 26);
-    const lExtraLen = buf.readUInt16LE(localOff + 28);
-    const dataStart = localOff + 30 + lNameLen + lExtraLen;
-    const raw = buf.subarray(dataStart, dataStart + compSize);
-    let data;
-    if (method === 0) data = raw;
-    else if (method === 8) data = zlib.inflateRawSync(raw);
-    else throw new Error(`不支持的压缩方式 ${method}：${name}`);
-    out.push({ name, data });
-    off += 46 + nameLen + extraLen + commentLen;
-  }
-  return out;
-}
-
-function extractZipTo(buf, targetDir) {
-  const names = [];
-  for (const e of readZipEntries(buf)) {
-    const rel = e.name.replace(/\\/g, '/');
-    if (rel.startsWith('/') || rel.split('/').includes('..')) throw new Error('包里有不安全路径：' + e.name);
-    const dest = join(targetDir, ...rel.split('/'));
-    mkdirSync(require('node:path').dirname(dest), { recursive: true });
-    writeFileSync(dest, e.data);
-    names.push(rel);
-  }
-  return names;
 }
 
 /**
@@ -1273,6 +1223,12 @@ async function applyUpdate() {
   });
   if (!res.ok) throw new Error(`下载新版本失败：HTTP ${res.status}`);
   const bytes = Buffer.from(await res.arrayBuffer());
+
+  // 先验再落盘：校验不过就一个字节都不写进安装目录，当前版本继续跑。
+  const check = updater.verifyDigest(bytes, info.asset.digest, info.asset.size);
+  if (!check.ok) throw new Error(check.reason);
+  if (check.skipped) log('发布记录没给 digest 也没给 size，跳过完整性校验');
+
   writeFileSync(pkgPath, bytes);
 
   const stageDir = join(UPDATE_DIR, `stage-${info.latest}`);
@@ -1280,22 +1236,18 @@ async function applyUpdate() {
   if (!existsSync(join(stageDir, 'ghost.json'))) throw new Error('新包解出来没有 ghost.json，放弃更新');
 
   const scriptPath = join(UPDATE_DIR, 'apply-update.ps1');
+  const syncScriptPath = join(UPDATE_DIR, 'sync-snapshot.cjs');
   const backup = `${INSTALL_DIR}.bak-${info.current}`;
-  // 单引号里再转义单引号，PowerShell 字符串才不会被路径里的空格/引号截断。
-  const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
-  const script = [
-    `$ErrorActionPreference = 'Stop'`,
-    `$root = ${q(INSTALL_DIR)}`,
-    `$stage = ${q(stageDir)}`,
-    `$backup = ${q(backup)}`,
-    `$oldPid = ${process.pid}`,
-    `try { Wait-Process -Id $oldPid -Timeout 60 -ErrorAction SilentlyContinue } catch {}`,
-    `Start-Sleep -Milliseconds 300`,
-    `if (-not (Test-Path $backup)) { Copy-Item $root $backup -Recurse -Force }`,
-    `Copy-Item (Join-Path $stage '*') $root -Recurse -Force`,
-    `Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue`,
-  ].join('\r\n');
-  writeFileSync(scriptPath, script, 'utf8');
+  writeFileSync(syncScriptPath, updater.buildSnapshotSyncScript({ installDir: INSTALL_DIR, pkgPath }), 'utf8');
+  writeFileSync(scriptPath, updater.buildApplyScript({
+    root: INSTALL_DIR,
+    stage: stageDir,
+    backup,
+    pkg: pkgPath,
+    syncScript: syncScriptPath,
+    nodeExe: process.execPath,
+    oldPid: process.pid,
+  }), 'utf8');
 
   const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
     detached: true, stdio: 'ignore', windowsHide: true,

@@ -3,6 +3,10 @@
 <p align="center"><b>把本机已登录的 Trae CN 额度接入 Cindy，零配置用你自己的账号额度。</b></p>
 
 <p align="center">
+  <a href="README.en.md"><b>English</b></a> · 简体中文
+</p>
+
+<p align="center">
   <a href="#安装">安装</a> ·
   <a href="#工作原理">工作原理</a> ·
   <a href="#模型列表">模型</a> ·
@@ -210,6 +214,7 @@ Copy-Item stage\* <安装目录> -Recurse -Force
 | `plugin/node/worker.cjs` | Node 常驻进程：起 HTTP 服务、三条协议路由、端口咬死、用量账本 |
 | `plugin/node/trae.cjs` | Trae 上游客户端：解密登录态、请求头、请求体整形、SSE 解码、模型目录、额度签到 |
 | `plugin/node/adapters.cjs` | Anthropic / Responses 与 OpenAI Chat 之间的协议翻译 |
+| `plugin/node/update.cjs` | 自更新纯函数：版本比较、digest 校验、zip 解包、脚本生成 |
 | `plugin/panel.*` | 右侧栏面板：账号、额度、签到、模型列表、Base URL / Token |
 
 它**不改 Cindy 的任何文件**，也不替你填供应商配置（Cindy 没给插件这个接口）。它就是给你一个端点，剩下那步在 Cindy 界面里点。
@@ -457,7 +462,9 @@ cd plugin && npm run pack       :: 打包
 node test\host-guard.js         :: Host 守卫 13 项（纯本地，不需要登录）
 node test\responses-status.js   :: Responses 状态映射 19 项（纯本地，不需要登录）
 node test\upstream-contract.js  :: 上游契约 16 项（纯本地：交错工具分片 / 截断判定 / usage 回传）
-node test\e2e-package.js        :: 包端到端 24 项（解包 → 起 worker → 真对话 → 三条协议 → 许可文件）
+node test\update-chain.js       :: 自更新链路 50 项（纯本地：版本比较 / digest 校验 / 解包 / 脚本生成）
+node test\feature-offline.js    :: 文生图参数 / 应答解析 / DeviceProof 串 / 图片 URL 39 项（纯本地，不花额度）
+node test\e2e-package.js        :: 包端到端 25 项（解包 → 起 worker → 真对话 → 三条协议 → 许可文件）
 node test\e2e-panel.js          :: 面板脚本 17 项
 node test\e2e-brain.js          :: 面板 ↔ 电子脑真实总线 13 项
 node test\smoke-protocols.js    :: 三条协议形状 19 项

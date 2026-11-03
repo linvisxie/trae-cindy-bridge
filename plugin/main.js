@@ -121,6 +121,27 @@ function statusLines(st) {
 
 // ---------- AI 工具调用 ----------
 
+// 把 Windows 本地路径变成 markdown 图片能用的地址。
+//
+// 直接塞 C:\Users\... 进 ![]() 有两个隐患：反斜杠在 markdown 里是转义符（虽然
+// CommonMark 只转义 ASCII 标点，本例路径后面全是字母、碰巧不坏），但「碰巧不坏」
+// 不是能指望的性质 —— 用户名或目录名一旦带 _ * [ ] 之类标点就会被吃掉。
+// 所以统一用 file:/// URL：反斜杠全转成正斜杠、盘符规范化，并对 URL 特殊字符做编码。
+//
+// 返回 { url, path }：url 给 markdown 用，path 给用户复制/在资源管理器里打开用。
+function localImageUrl(file) {
+  const raw = String(file || '');
+  // 已经是 URL 就别再包一层
+  if (/^(file|https?):\/\//i.test(raw)) return { url: raw, path: raw };
+  const slashed = raw.replace(/\\/g, '/');
+  // 空格、#、?、% 这几个在 URL 里必须编码，否则会被当成分隔符/锚点。
+  // 空格留裸的会直接把 markdown 的 ![]() 语法截断（CommonMark 允许 <...> 包裹，
+  // 但很多渲染器不认），所以一律编成 %20。
+  const encoded = slashed.replace(/[%#? ]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  const withSlash = encoded.startsWith('/') ? encoded : '/' + encoded;
+  return { url: 'file://' + withSlash, path: raw };
+}
+
 cindy.onHostMessage(async function (msg) {
   if (msg.type !== 'tool-call') return;
   const ok = (result) => cindy.send({ type: 'tool-result', callId: msg.callId, ok: true, result });
@@ -186,11 +207,12 @@ cindy.onHostMessage(async function (msg) {
       const size = typeof args.size === 'string' && args.size.trim() ? args.size.trim() : undefined;
       const r = await callWorker('trae/drawImage', msg.callId, { prompt, ...(size ? { size } : {}) });
       const kb = Math.max(1, Math.round((r.bytes || 0) / 1024));
+      const img = localImageUrl(r.file);
       ok({
         text: [
-          `![Trae 文生图](${r.file})`,
+          `![Trae 文生图](${img.url})`,
           `文生图 · 模型：${r.model || 'seedream_5'} · 尺寸：${size || '1920x1920'} · ${kb} KB`,
-          `文件：${r.file}`,
+          `文件：${img.path}`,
           '这张真实扣了 Trae 积分（1920x1920 约 8.8），具体数字以 Trae 额度面板为准。',
         ].join('\n'),
       });

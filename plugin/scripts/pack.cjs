@@ -19,6 +19,7 @@ const FILES = [
   { from: 'panel.js', name: 'panel.js' },
   { from: 'node/worker.cjs', name: 'node/worker.cjs' },
   { from: 'node/adapters.cjs', name: 'node/adapters.cjs' },
+  { from: 'node/update.cjs', name: 'node/update.cjs' },
   { from: 'node/trae.cjs', name: 'node/trae.cjs' },
   // MIT 要求分发时随附许可与版权声明，跑到别人机器上的 .cindy 才是真正的「分发」。
   { from: '../LICENSE', name: 'LICENSE' },

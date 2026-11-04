@@ -803,7 +803,9 @@ function errorBodyOf(e) {
 async function chatCompletions(req, res) {
   const parsed = await readJsonBody(req, res);
   if (!parsed.ok) return;
-  const payload = parsed.value;
+  // body 可能是 JSON 标量（null、数字、字符串）：一律当空对象处理，
+  // 让后面的校验按 400 回，而不是在这里读 .model 抛 TypeError 变 500。
+  const payload = parsed.value && typeof parsed.value === 'object' ? parsed.value : {};
 
   const displayModel = normalizeModelKey(payload.model);
   const entry = resolveEntry(displayModel);
@@ -852,7 +854,8 @@ async function chatCompletions(req, res) {
 
   if (!wantStream) {
     const content = []; const calls = new Map(); let finish = 'stop'; let usage;
-    for (let s = first; !s.done; s = await iterator.next()) {
+    try {
+      for (let s = first; !s.done; s = await iterator.next()) {
       const c = s.value;
       if (c?.usage != null) usage = c.usage;
       const ch = c?.choices?.[0];
@@ -867,7 +870,16 @@ async function chatCompletions(req, res) {
         if (t.function && t.function.arguments) cur.function.arguments += t.function.arguments;
         calls.set(i, cur);
       }
-      if (typeof ch.finish_reason === 'string') finish = ch.finish_reason;
+        if (typeof ch.finish_reason === 'string') finish = ch.finish_reason;
+      }
+    } catch (e) {
+      // 非流式中途出错也要走统一映射（排队 503、上游 401/403/429 透传），
+      // 不能冒泡到顶层兜底变成裸 500 + 原始异常；已拿到的 usage 照常记账。
+      log('对话失败', displayModel, e.message.slice(0, 200));
+      recordUsage(entry || { model: displayModel }, 'chat', usage?.prompt_tokens, usage?.completion_tokens);
+      sendJson(res, errorStatusOf(e), errorBodyOf(e));
+      cancelOnClose.done();
+      return;
     }
     for (const cur of calls.values()) if (!cur.id) cur.id = `call_${crypto.randomBytes(6).toString('hex')}`;
     const message = { role: 'assistant', content: content.join('') };
@@ -995,7 +1007,11 @@ async function anthropicMessages(req, res) {
   const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
   try {
     if (chat.stream) await adapters.writeAnthropicStream(res, up.first, up.iterator, opts);
-    else sendJson(res, 200, await adapters.anthropicMessage(up.first, up.iterator, opts));
+    else {
+      // 非流式聚合中途的上游错误（断流/错误帧）走统一映射，别冒泡成裸 500。
+      try { sendJson(res, 200, await adapters.anthropicMessage(up.first, up.iterator, opts)); }
+      catch (e) { sendJson(res, errorStatusOf(e), errorBodyOf(e)); }
+    }
   } finally {
     up.cancelOnClose.done();
     // 上游给了真实 usage 就用真实的，没给才退回估算；输出侧以前写死 0，账本里永远是 0 token。
@@ -1046,7 +1062,11 @@ async function openaiResponses(req, res) {
   const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
   try {
     if (chat.stream) await adapters.writeResponsesStream(res, up.first, up.iterator, opts);
-    else sendJson(res, 200, await adapters.responsesMessage(up.first, up.iterator, opts));
+    else {
+      // 同 anthropicMessages：非流式中途出错走统一映射，别冒泡成裸 500。
+      try { sendJson(res, 200, await adapters.responsesMessage(up.first, up.iterator, opts)); }
+      catch (e) { sendJson(res, errorStatusOf(e), errorBodyOf(e)); }
+    }
   } finally {
     up.cancelOnClose.done();
     const out = opts.usage && typeof opts.usage.completion_tokens === 'number' ? opts.usage.completion_tokens : 0;
@@ -1252,7 +1272,19 @@ async function checkUpdate() {
  * 拉起来（实测约 24 秒），起来时读到的就是新文件。
  * 替换前先整目录备份成 `<安装目录>.bak-<旧版本>`，拷坏了还能手工还原。
  */
+// 更新在途锁：面板连点或面板+工具两路同时喊 applyUpdate 时，只允许一个真的下载安装，
+// 其余直接回「正在进行」。原来没有任何互斥，两次下载、两个安装脚本抢同一个安装目录是可能的。
+let updateInFlight = false;
 async function applyUpdate() {
+  if (updateInFlight) {
+    return { applied: false, error: '更新已在进行中', message: '更新已在进行中，不用重复点，等它装完自动重启。' };
+  }
+  updateInFlight = true;
+  try { return await applyUpdateOnce(); }
+  finally { updateInFlight = false; }
+}
+
+async function applyUpdateOnce() {
   const info = await checkUpdate();
   if (!info.hasUpdate) return { ...info, applied: false };
   if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');

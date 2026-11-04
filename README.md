@@ -245,6 +245,10 @@ npm run pack        :: 产出 dist\trae-cindy-bridge.cindy
 
 `.cindy` 就是个 zip（`ghost.json` 在根部），`scripts/pack.cjs` 是零依赖的手写打包器，同样输入产出同样字节。
 
+> **从 0.1.12 起，同一提交在任何时区（UTC / 北京时间）打出的 sha256 相同。** 前提是工作区文件是 LF —— `pack.cjs` 直接读工作区字节，不做换行归一化。
+>
+> `.gitattributes` 保证正常 `git checkout` 得到 LF，但**如果你用编辑器把某个源文件另存成了 CRLF，本地重打的哈希就会与 Release 不同**。这种情况不是发布包被篡改，只是你的工作区与发布时的字节不一样：`git checkout -- .` 恢复后重打即可对上。核对发布包完整性请直接用 Release 上的 `SHA256SUMS.txt`。
+
 > 文件名必须以 **`trae-cindy-bridge`** 开头。Cindy 不认 `cindy-` 打头的包名。
 
 ### 2. 装进 Cindy
@@ -451,7 +455,7 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 
 ## 开发与测试
 
-`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Trae CN**（要真读登录态、真打上游）；`host-guard`、`responses-status`、`upstream-contract` 是纯本地的。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
+`test/` 下每个脚本都是独立的、可复跑的判据。多数脚本**需要先装好并登录 Trae CN**（要真读登录态、真打上游）；纯本地的有 `host-guard`、`responses-status`、`upstream-contract`、`update-chain`、`review-regressions`、`feature-offline`。没登录时 `features` 与 `e2e-panel` 会把依赖登录态的用例打 `--` / `SKIP` 跳过，不会崩，但那样等于没验到。
 
 额度耗尽（上游回 `4008`）时，所有需要上游 200 的用例会自动降级成 `SKIP` 而不是 `FAIL` —— 那是账号状态，不是代码回归。
 
@@ -462,7 +466,8 @@ cd plugin && npm run pack       :: 打包
 node test\host-guard.js         :: Host 守卫 13 项（纯本地，不需要登录）
 node test\responses-status.js   :: Responses 状态映射 19 项（纯本地，不需要登录）
 node test\upstream-contract.js  :: 上游契约 16 项（纯本地：交错工具分片 / 截断判定 / usage 回传）
-node test\update-chain.js       :: 自更新链路 50 项（纯本地：版本比较 / digest 校验 / 解包 / 脚本生成）
+node test\update-chain.js       :: 自更新链路 52 项（纯本地：版本比较 / digest fail-closed / 解包 / 回滚脚本生成）
+node test\review-regressions.js :: 历次复审行为回归 46 项（纯本地：额度容错 / 凭据代次 / 错误映射 / 打包身份校验）
 node test\feature-offline.js    :: 文生图参数 / 应答解析 / DeviceProof 串 / 图片 URL 39 项（纯本地，不花额度）
 node test\e2e-package.js        :: 包端到端 25 项（解包 → 起 worker → 真对话 → 三条协议 → 许可文件）
 node test\e2e-panel.js          :: 面板脚本 17 项
@@ -548,6 +553,8 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 - **Cindy 详情页的「报价」修不掉**。自定义供应商的模型解析器不读 `displayPricing` / `currency` / `cost` 任何字段，所以那句「该路由没有报价数据」删不掉；倍率只能写在模型名里和面板上。
 - **依赖 Trae 的内部接口**。上游一改，插件就失效。这不是「长期稳定」的东西。
 - **凭据格式一改就挂**。自有 AES 封装是逆向出来的，Trae 换加密方式（或者换 salt）之后必须先更新插件才能用。
+- **省略 `stream` 时按流式返回**，与三份官方协议的默认值（非流式）相反。这是刻意的兼容取舍：Cindy 的 Anthropic 接入探测不传 `stream` 字段，且按 `text/event-stream` 解析响应；若改成官方语义，保存供应商的探测会直接判定「接入不兼容」。标准 SDK 想拿非流式响应，显式传 `stream: false` 即可。详见 issue #7。
+- **Responses 协议不输出推理内容**。经 `/v1/responses` 用推理模型时，正文里没有 `reasoning` 输出项，但 usage 仍照常上报 `reasoning_tokens`。Anthropic 与 Chat 两条链路会正常透传推理内容，只有 Responses 这条缺。修复需要先定输出形态（`reasoning` 输出项 vs summary 文本），详见 issue #12。
 
 ## 免责声明
 

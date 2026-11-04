@@ -279,6 +279,16 @@ npm run pack        :: produces dist\trae-cindy-bridge.cindy
 A `.cindy` is just a zip (with `ghost.json` at the root). `scripts/pack.cjs` is a
 zero-dependency hand-rolled packer — same input, same bytes out.
 
+> **Since 0.1.12, the same commit produces an identical sha256 in any timezone (UTC / UTC+8).**
+> The one precondition is that worktree files use LF — `pack.cjs` reads worktree bytes directly
+> and does not normalize line endings.
+>
+> `.gitattributes` guarantees LF on a normal `git checkout`, but **if an editor saves a source
+> file with CRLF, a local rebuild will hash differently from the release.** That is not evidence
+> of a tampered package — it means your worktree bytes differ from the ones that were packaged.
+> Run `git checkout -- .` and rebuild to match. To verify a release package, use
+> `SHA256SUMS.txt` from the release page.
+
 ### 2. Install into Cindy
 
 Cindy → Plugins → import the `.cindy` (or drag the file in).
@@ -462,8 +472,8 @@ Environment variables (rarely needed):
 
 Each script under `test/` is an independent, re-runnable check. Most **need Trae CN
 installed and signed in** (they read real login state and hit the real upstream);
-`host-guard`, `responses-status`, `upstream-contract`, `update-chain`, `feature-offline`
-are fully local. Without a login, `features` and `e2e-panel` mark login-dependent cases
+`host-guard`, `responses-status`, `upstream-contract`, `update-chain`,
+`review-regressions` and `feature-offline` are fully local. Without a login, `features` and `e2e-panel` mark login-dependent cases
 `--` / `SKIP` instead of crashing — but that means they didn't really verify anything.
 
 When quota is exhausted (upstream returns `4008`), every case that needs an upstream 200
@@ -477,7 +487,8 @@ cd plugin && npm run pack       :: build the package
 node test\host-guard.js         :: Host guard, 13 cases (local, no login)
 node test\responses-status.js   :: Responses status mapping, 19 cases (local, no login)
 node test\upstream-contract.js  :: upstream contract, 16 cases (local: interleaved tool fragments / truncation / usage)
-node test\update-chain.js       :: self-update chain, 50 cases (local: version compare / digest / unzip / script generation)
+node test\update-chain.js       :: self-update chain, 52 cases (local: version compare / digest fail-closed / unzip / rollback script)
+node test\review-regressions.js :: past review regressions, 46 cases (local: quota tolerance / credential generation / error mapping / package identity)
 node test\feature-offline.js    :: image params, response parsing, DeviceProof string, image URL, 39 cases (local, no quota)
 node test\e2e-package.js        :: package end-to-end, 25 cases (unzip -> start worker -> real chat -> three protocols -> license files)
 node test\e2e-panel.js          :: panel script, 17 cases
@@ -581,6 +592,16 @@ tool names, and create a single point of failure.
   route" stays; the price factor can only live in the model name and the panel.
 - **Depends on Trae's internal endpoints.** When upstream changes, the plugin breaks. This
   is not a "long-term stable" thing.
+- **Omitting `stream` returns a streaming response**, the opposite of the three official
+  protocol defaults (non-streaming). Deliberate compatibility trade-off: Cindy's Anthropic
+  probe omits `stream` and parses the reply as `text/event-stream`, so the official default
+  would make it report the endpoint as incompatible. Pass `stream: false` explicitly if you
+  want a non-streaming reply. See issue #7.
+- **The Responses protocol drops reasoning content.** With a reasoning model over
+  `/v1/responses`, the output contains no `reasoning` item, yet usage still reports
+  `reasoning_tokens`. The Anthropic and Chat paths pass reasoning through correctly; only
+  Responses is missing it. Fixing it requires deciding the output shape first (`reasoning`
+  item vs summary text). See issue #12.
 - **A credential format change breaks it.** The proprietary AES wrapper is
   reverse-engineered; when Trae changes encryption (or rotates the salt), the plugin must be
   updated before it works again.

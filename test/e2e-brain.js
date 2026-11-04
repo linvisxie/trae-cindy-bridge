@@ -180,9 +180,10 @@ function makeElement(id) {
   expect('工具 trae_status 成功', statusCall && statusCall.ok, true);
   expect('工具 trae_status 文本含真账号', statusCall && statusCall.result && statusCall.result.text,
     (v) => typeof v === 'string' && (signedIn ? v.includes(account) && !v.includes('未登录') : v.includes('未登录')));
-  expect('工具 trae_endpoint 成功', epCall && epCall.ok, true);
+  // 未登录时 endpoint 按设计回 ok:false：断言跟登录态走，别把环境缺失报成产品失败。
+  expect('工具 trae_endpoint 成功', epCall && epCall.ok, signedIn);
   expect('工具 trae_endpoint 文本含 BaseURL', epCall && epCall.result && epCall.result.text,
-    (v) => typeof v === 'string' && v.includes(realStatus.baseUrl));
+    (v) => signedIn ? (typeof v === 'string' && v.includes(realStatus.baseUrl)) : v == null);
 
   worker.close();
   registry.length = 0;
@@ -190,7 +191,7 @@ function makeElement(id) {
   let failed = 0;
   for (const c of checks) {
     if (!c.pass) failed++;
-    console.log(`${c.pass ? 'PASS' : 'FAIL'}  ${c.name}${c.pass ? '' : '  got=' + JSON.stringify(c.got).slice(0, 160)}`);
+    console.log(`${c.pass ? 'PASS' : 'FAIL'}  ${c.name}${c.pass ? '' : '  got=' + String(JSON.stringify(c.got ?? null)).slice(0, 160)}`);
   }
   console.log(`\n${checks.length - failed}/${checks.length} 通过`);
   process.exit(failed === 0 ? 0 : 1);

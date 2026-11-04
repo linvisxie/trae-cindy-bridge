@@ -122,7 +122,7 @@ async function refreshCredential(force) {
       credentialError = '';
     } else {
       credentialError = (r && r.reason) || 'read-failed';
-      if (force) { credential = undefined; identity = undefined; diskCredentialFingerprint = ''; credentialAt = 0; credentialGeneration += 1; }
+      if (force || credentialError === 'no-auth-key' || credentialError === 'not-found') { credential = undefined; identity = undefined; diskCredentialFingerprint = ''; credentialAt = 0; credentialGeneration += 1; }
     }
   } catch (e) {
     credentialError = e.message;

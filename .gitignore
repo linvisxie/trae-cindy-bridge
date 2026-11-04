@@ -38,3 +38,6 @@ Thumbs.db
 
 # CI 运行产物（测试日志、JUnit、校验报告）：只该出现在 Actions 里
 artifacts/
+
+# 临时中间文件
+*.tmp

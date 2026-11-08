@@ -74,11 +74,14 @@ async function main() {
     'localhost:' + PORT,
     '[::1]',
     '[::1]:' + PORT,
-    '::1',
     '127.0.0.2',
   ];
   // 必须拒绝的
   const deny = [
+    '::1',
+    '[::1].evil.example',
+    '[::1]:65536',
+    '127.256.0.1',
     'example.com',
     'evil.com:' + PORT,
     '10.0.0.1:' + PORT,

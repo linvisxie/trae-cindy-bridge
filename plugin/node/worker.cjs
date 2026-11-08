@@ -97,7 +97,7 @@ function loadState() {
 function saveState(patch) {
   try {
     mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify({ ...loadState(), ...patch }, null, 1));
+    writeJsonAtomic(STATE_FILE, { ...loadState(), ...patch });
   } catch (e) { log('state write failed', e.message); }
 }
 
@@ -380,11 +380,8 @@ function writeJsonAtomic(file, value) {
   writeFileSync(tmp, JSON.stringify(value, null, 1));
   try { renameSync(tmp, file); }
   catch (e) {
-    // Windows 上目标被别的进程短暂占住时 rename 会失败，退回直写再清临时文件
-    try { writeFileSync(file, JSON.stringify(value, null, 1)); } finally {
-      try { unlinkSync(tmp); } catch {}
-    }
-    if (e && e.code !== 'EPERM' && e.code !== 'EACCES' && e.code !== 'EBUSY') throw e;
+    try { unlinkSync(tmp); } catch {}
+    throw e;
   }
 }
 
@@ -559,6 +556,19 @@ function humanizeUpstreamError(err) {
 
 // ---------- 请求翻译与校验 ----------
 
+function validateTools(tools, protocol) {
+  if (tools === undefined) return;
+  if (!Array.isArray(tools)) throw new Error('tools 必须是数组');
+  tools.forEach((tool, i) => {
+    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) throw new Error('第 ' + i + ' 个工具不是对象');
+    const supported = protocol === 'responses' ? tool.type === 'function' : tool.type === undefined || tool.type === 'custom';
+    if (!supported) throw new Error('不支持的工具类型：' + tool.type);
+    if (typeof tool.name !== 'string' || !tool.name.trim()) throw new Error('第 ' + i + ' 个工具缺 name');
+    const schema = protocol === 'responses' ? tool.parameters : tool.input_schema;
+    if (schema !== undefined && (!schema || typeof schema !== 'object' || Array.isArray(schema))) throw new Error('第 ' + i + ' 个工具 schema 必须是对象');
+  });
+}
+
 // 顺序很重要：畸形 tool 必须在查凭证之前就 400，否则「Trae 未登录」会盖住「你的
 // JSON Schema 写错了」，用户会去折腾登录。
 function toChatMessages(list) {
@@ -632,22 +642,14 @@ function isLoopbackAddr(a) {
   return s === '::1' || s === '127.0.0.1' || s.startsWith('127.') || s === '::ffff:127.0.0.1';
 }
 
-// 只放行 loopback。按 hostname 判，端口可有可无，[::1] 与 ::1 都认——带端口的前缀匹配
-// 会把不带默认端口的 Host（部分 SDK / 代理会去掉）误判成 403。
+// 校验完整 authority；端口可省略，IPv6 必须带方括号。
 function hostOk(req) {
   const raw = String(req.headers.host || '').toLowerCase().trim();
   if (!raw) return isLoopbackAddr(req.socket && req.socket.remoteAddress);
-  let hostname = raw;
-  if (hostname.startsWith('[')) {
-    const end = hostname.indexOf(']');
-    hostname = end !== -1 ? hostname.slice(0, end + 1) : hostname;
-  } else {
-    const colon = hostname.lastIndexOf(':');
-    if (colon !== -1 && hostname.indexOf(':') === colon) hostname = hostname.slice(0, colon);
-  }
-  if (!hostname) return false;
-  if (hostname === 'localhost' || hostname === '[::1]' || hostname === '::1') return true;
-  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+  const match = /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])(?::([0-9]+))?$/.exec(raw);
+  if (!match) return false;
+  if (match[2] !== undefined && (Number(match[2]) < 1 || Number(match[2]) > 65535)) return false;
+  return !match[1].startsWith('127.') || match[1].split('.').every(part => Number(part) <= 255);
 }
 
 function authOk(req) {
@@ -728,6 +730,7 @@ async function handle(req, res) {
     if (!parsed.ok) return;
     let chat;
     try {
+      validateTools(parsed.value && parsed.value.tools, 'anthropic');
       chat = adapters.anthropicRequestToChat(parsed.value);
     } catch (e) {
       sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
@@ -972,6 +975,7 @@ async function anthropicMessages(req, res) {
 
   let chat;
   try {
+    validateTools(parsed.value && parsed.value.tools, 'anthropic');
     chat = adapters.anthropicRequestToChat(parsed.value);
   } catch (e) {
     sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
@@ -1026,6 +1030,7 @@ async function openaiResponses(req, res) {
 
   let chat;
   try {
+    validateTools(parsed.value && parsed.value.tools, 'responses');
     chat = adapters.responsesRequestToChat(parsed.value);
   } catch (e) {
     sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
@@ -1280,8 +1285,12 @@ async function applyUpdate() {
     return { applied: false, error: '更新已在进行中', message: '更新已在进行中，不用重复点，等它装完自动重启。' };
   }
   updateInFlight = true;
-  try { return await applyUpdateOnce(); }
-  finally { updateInFlight = false; }
+  let handedOff = false;
+  try {
+    const result = await applyUpdateOnce();
+    handedOff = result.applied === true;
+    return result;
+  } finally { if (!handedOff) updateInFlight = false; }
 }
 
 async function applyUpdateOnce() {

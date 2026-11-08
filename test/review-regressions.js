@@ -26,6 +26,7 @@ function worker(options = {}) {
     __dirname: path.dirname(file), Buffer, URL, TextDecoder, AbortController, AbortSignal,
     require(id) {
       if (id === './trae.cjs' && options.trae) return options.trae;
+      if (id === 'node:fs' && options.fs) return { ...baseRequire(id), ...options.fs };
       if (id === 'node:child_process') return {
         ...baseRequire(id),
         spawn() {
@@ -135,11 +136,11 @@ for (const code of ['ENOENT', 'EACCES']) test(`installer ${code} leaves worker r
   assert.equal(w.launches.length, 1); assert.equal(w.exits.length, 0);
   assert.deepEqual(fs.readdirSync(path.join(w.dir, 'update')), []);
 });
-test('successful spawn schedules exit only after start and uses fresh staging', async () => {
+test('successful handoff retains update lock until exit', async () => {
   const w = worker(); prepareUpdate(w, entries());
   const first = await w.run('applyUpdate()'), second = await w.run('applyUpdate()');
-  assert.equal(first.applied, true); assert.equal(w.exits.length, 2);
-  assert.notEqual(first.scriptPath, second.scriptPath);
+  assert.equal(first.applied, true); assert.equal(second.applied, false);
+  assert.equal(w.exits.length, 1); assert.equal(w.launches.length, 1);
 });
 test('release selection uses exact plugin package name', async () => {
   const w = worker();
@@ -387,7 +388,7 @@ if (IS_TRAE) {
 }
 
 // Third review: malformed successful HTTP responses must preserve the last quota.
-for (const bad of ['not JSON', '{}', '{"code":"TOKEN_EXPIRED"}', '{"success":false}']) {
+for (const bad of ['not JSON', '{}', '{"code":"TOKEN_EXPIRED"}', '{"success":false}', ...(IS_TRAE ? ['{"usage_summary":{"total_amount":100,"consumed_amount":"bad"}}', '{"usage_summary":{"total_amount":100,"consumed_amount":-1}}', '{"usage_summary":{"total_amount":100,"consumption_ratio":null}}'] : [])]) {
   test(`invalid quota payload preserves old value: ${bad}`, async () => {
     const w = worker();
     w.run("refreshCredential=async()=>({token:'fixture'})");
@@ -434,3 +435,92 @@ if(IS_TRAE){
   await w.run('refreshCredential(true)');broken=true;w.run('credentialAt=0');assert.equal((await w.run('refreshCredential(false)')).token,'A');
  });
 }
+
+for (const route of ['/v1/messages', '/v1/responses']) test('partial usage survives error ' + route, async () => {
+  const w = worker();
+  w.run("token='local-test';models=[{key:'test',name:'Test'}];refreshCredential=async()=>({token:'fixture'});streamChat=async function*(){yield{choices:[{delta:{content:'hi'}}],usage:{prompt_tokens:123,completion_tokens:45}};throw Object.assign(Error('quota'),{status:402,upstreamCode:4008});}");
+  const res = await request(w, route, { model:'test', messages:[{role:'user',content:'Hi'}], input:'Hi', stream:false });
+  assert.equal(res.status,402);
+  const stats = Object.values(JSON.parse(fs.readFileSync(path.join(w.dir,'usage.json'))).days)[0].models.test;
+  assert.equal(stats.in,123); assert.equal(stats.out,45);
+});
+
+test('failed atomic rename preserves usage and state files', () => {
+  const w = worker({ fs: { renameSync() { throw Object.assign(Error('busy'), {code:'EBUSY'}); } } });
+  for (const name of ['usage.json','state.json']) {
+    const file = path.join(w.dir,name); fs.writeFileSync(file,'{"old":true}');
+    w.ctx.atomicFile = file;
+    assert.throws(() => w.run('writeJsonAtomic(atomicFile,{changed:true})'), /busy/);
+    if (name === 'state.json') w.run('saveState({changed:true})');
+    assert.equal(fs.readFileSync(file,'utf8'),'{"old":true}');
+  }
+  assert.equal(fs.readdirSync(w.dir).some(f => f.endsWith('.tmp')),false);
+});
+
+async function traeChunks(events) {
+  const original = global.fetch;
+  global.fetch = async () => new Response(events.map(([event,data]) => 'event: '+event+'\ndata: '+JSON.stringify(data)+'\n\n').join(''));
+  try {
+    const chunks = [];
+    for await (const chunk of require('../plugin/node/trae.cjs').streamChat({token:'fixture'}, {}, {model:'test',messages:[{role:'user',content:'hi'}]})) chunks.push(chunk);
+    return chunks;
+  } finally { global.fetch = original; }
+}
+test('tool fragments preserve abnormal upstream finish reasons', async () => {
+  for (const reason of ['length','content_filter','stop']) {
+    const chunks = await traeChunks([
+      ['output',{tool_calls:[{index:0,id:'call',function:{name:'test',arguments:'{"x":'}}]}],
+      ['done',{finish_reason:reason}],
+    ]);
+    assert.equal(chunks.at(-1).choices[0].finish_reason, reason === 'stop' ? 'tool_calls' : reason);
+  }
+});
+
+test('upstream 1001 is authentication failure', async () => {
+  await assert.rejects(traeChunks([['error',{code:1001,message:'expired'}]]), e => e.status === 401);
+});
+
+test('package source comparison covers trae and rejects unmapped entries', () => {
+  const file = path.join(ROOT,'.github/scripts/verify-package.cjs');
+  const src = fs.readFileSync(file,'utf8');
+  const block = src.slice(src.indexOf('const packagedByRepoPath ='),src.indexOf("check('包内每个文件"));
+  function compare(entries) {
+    const ctx = vm.createContext({ entries, manifest:{}, hasGit:true, gitBlob(rel) { assert.equal(rel,'plugin/node/trae.cjs'); return Buffer.from('source'); } });
+    vm.runInContext(block+';globalThis.result=drift;',ctx);
+    return ctx.result;
+  }
+  assert.equal(compare([{name:'node/trae.cjs',data:Buffer.from('ALTERED CODE')}]).length,1);
+  assert.equal(compare([{name:'unmapped.cjs',data:Buffer.from('source')}]).length,1);
+  assert.equal(compare([{name:'node/trae.cjs',data:Buffer.from('source')}]).length,0);
+});
+
+test('reasoning token count reaches Chat and Responses usage', async () => {
+  const chunks = await traeChunks([['token_usage',{prompt_tokens:3,completion_tokens:5,total_tokens:8,reasoning_tokens:2}],['done',{finish_reason:'stop'}]]);
+  assert.equal(chunks.at(-1).usage.completion_tokens_details.reasoning_tokens,2);
+  const opts = {model:'test'};
+  const response = await require('../plugin/node/adapters.cjs').responsesMessage({done:false,value:chunks.at(-1)},{next:async()=>({done:true})},opts);
+  assert.equal(response.usage.output_tokens_details.reasoning_tokens,2);
+});
+
+test('Host authority validates complete IPv6, IPv4 and port', () => {
+  const w = worker();
+  for (const [allowed,hosts] of [
+    [true,['localhost','localhost:80','127.0.0.1','127.255.255.255:65535','[::1]','[::1]:47822']],
+    [false,['[::1].evil.example','[::1]:80.evil','[::1]:','[::1]:0','[::1]:65536','[::1]:-1','[::1]:abc','::1','127.256.0.1','127.0.0.999','localhost:abc','localhost:0','evil.example']],
+  ]) for (const host of hosts) {
+    w.ctx.host = host;
+    assert.equal(w.run("hostOk({headers:{host},socket:{remoteAddress:'127.0.0.1'}})"),allowed,host);
+  }
+});
+
+test('malformed adapter tools fail before opening upstream', async () => {
+  for (const route of ['/v1/messages','/v1/responses']) {
+    const w = worker();
+    w.run("token='local-test';refreshCredential=async()=>{throw Error('must not open upstream')}");
+    for (const tools of [{},null,[null],[[]],[{type:'function'}],[{type:'web_search',name:'search'}],[{type:'function',name:'test',parameters:[]}],[{name:'test',input_schema:[]}]] ) {
+      const res = await request(w,route,{model:'test',messages:[{role:'user',content:'Hi'}],input:'Hi',tools});
+      assert.equal(res.status,400,route + JSON.stringify(tools));
+      assert.ok(!res.text.includes('must not open upstream'));
+    }
+  }
+});

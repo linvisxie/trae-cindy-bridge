@@ -662,6 +662,7 @@ function traeFailureOf(decoded) {
 // 上游码 → 本地 HTTP 语义。额度耗尽/会员相关给 402，临时性服务端缺口给 503，
 // 这样调用方看到 402 就知道「不是我这边的错，是账号额度」，不会被误导去重试或重登录。
 function statusOfTraeCode(code) {
+  if (code === 1001) return 401;   // 登录过期
   if (code === 1005) return 402;   // 需要付费套餐
   if (code === 4008) return 402;   // SOLO 额度耗尽
   if (code === 4222) return 402;   // 企业租户额度耗尽
@@ -810,6 +811,7 @@ async function* streamChat(credential, identity, request, signal) {
         prompt_tokens: decoded.inputTokens,
         completion_tokens: decoded.outputTokens,
         total_tokens: decoded.totalTokens,
+        completion_tokens_details: { reasoning_tokens: decoded.reasoningTokens },
         // 两个缓存字段无条件带上。别只在非零时才写：Cindy 判一条 usage 是否「完整」
         // 靠 hasOwnProperty，缺字段会让那一轮被当成未结算。虽然 Cindy 的
         // parseChunkUsage 用 ??0 兜底不会崩，但「时有时无」的字段形状会让
@@ -824,7 +826,8 @@ async function* streamChat(credential, identity, request, signal) {
     if (decoded.type === 'done') {
       if (finished) return;
       finished = true;
-      yield chunk({}, sawToolCalls ? 'tool_calls' : (decoded.finishReason || 'stop'), usage);
+      const reason = decoded.finishReason || 'stop';
+      yield chunk({}, sawToolCalls && reason === 'stop' ? 'tool_calls' : reason, usage);
       return;
     }
   };
@@ -1110,9 +1113,17 @@ async function refreshUsage(credential) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)
       || payload.success === false || payload.error) throw new Error('Trae usage response is invalid');
   const summary = payload.usage_summary;
-  const amount = summary && summary.total_amount;
-  const validAmount = (typeof amount === 'number' || (typeof amount === 'string' && amount.trim() !== ''))
-    && Number.isFinite(Number(amount)) && Number(amount) >= 0;
+  const validNumber = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
+    && Number.isFinite(Number(value)) && Number(value) >= 0;
+  const validAmount = summary && validNumber(summary.total_amount);
+  for (const field of ['consumed_amount', 'consumption_ratio']) {
+    if (summary && Object.hasOwn(summary, field) && !validNumber(summary[field])) {
+      throw new Error('Trae usage response has invalid ' + field);
+    }
+  }
+  if (payload.usage && Object.hasOwn(payload.usage, 'credits_amount') && !validNumber(payload.usage.credits_amount)) {
+    throw new Error('Trae usage response has invalid credits_amount');
+  }
   // An explicit empty entitlement list with a null summary is a no-quota response.
   const noQuota = summary === null && Array.isArray(payload.user_entitlement_pack_list)
     && payload.user_entitlement_pack_list.length === 0;

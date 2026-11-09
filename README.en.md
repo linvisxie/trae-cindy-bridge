@@ -189,20 +189,7 @@ personal plans; upstream doesn't return the exact number.
 
 ### Self-update
 
-The panel's **Check for updates** button / the `trae_update` tool. It reads GitHub
-Releases' REST API (public repo, anonymous read — no gh CLI, no proxy config), compares
-against the version in `ghost.json`, and on a new release downloads and unpacks it to
-`update/stage-<version>`, then hands off to a detached PowerShell script:
-
-```
-Wait-Process -Id <current worker pid>        -> wait for self to exit
-Copy-Item <install dir> <install dir>.bak-<old version>   (only if the backup doesn't exist)
-Copy-Item stage\* <install dir> -Recurse -Force
-```
-
-**Why it can't overwrite itself in-process**: a running `.js` file is locked on Windows,
-so self-overwrite always fails with `EBUSY`／`EPERM`. About 24 seconds after the worker
-exits, Cindy restarts it on the new files.
+The panel's **Check for updates** button / `trae_update` reads GitHub Releases, compares versions, verifies and stages the package, then delegates to a detached PowerShell installer. It must wait for the old worker to exit before backup and copy; if that process remains alive, installation stops. Do not assume a fixed restart time or guaranteed overwrite success. See update safety and host-record limitations below.
 
 ### Quota and check-in
 
@@ -215,8 +202,7 @@ Base `https://api.trae.cn`, four endpoints:
 | `/trae/api/v2/ug/checkin_credits/claim` | Claim. Needs `x-device-id`, idempotent per **Beijing date** |
 | `/trae/api/v2/ug/activity/info` | Campaign info |
 
-Check-in is the **only** call that changes anything on the account (claiming credits Trae
-is already offering your own account), and it never runs automatically.
+Check-in claims credits offered to your own account and never runs automatically. Image generation also spends credits, and credential renewal exchanges tokens; these operations are not read-only.
 
 ### Three protocols
 
@@ -238,15 +224,17 @@ All implemented at once:
 | File | Role |
 |---|---|
 | `plugin/main.js` | The brain: forwards AI tool calls and panel requests to the worker |
+| `plugin/node/bootstrap.cjs` | Manifest `node.entry` (`node/bootstrap.cjs`): acquires install and data locks before loading any business modules / worker |
 | `plugin/node/worker.cjs` | Resident Node process: HTTP server, three protocol routes, pinned port, usage ledger |
 | `plugin/node/trae.cjs` | Trae upstream client: credential decryption, headers, body shaping, SSE decoding, model catalog, quota and check-in |
 | `plugin/node/adapters.cjs` | Protocol translation between Anthropic / Responses and OpenAI Chat |
 | `plugin/node/update.cjs` | Pure functions for self-update: version compare, digest check, unzip, script generation |
+| `plugin/node/download.cjs` | Update URL, redirect and package-size restrictions |
+| `plugin/node/ownership.cjs` | OS-exclusive ownership of the install and runtime data directories |
+| `plugin/node/update-status.cjs` | Update journal attempt / result and interrupted-update boot guards |
 | `plugin/panel.*` | Right-side panel: account, quota, check-in, model list, Base URL / token |
 
-It **does not modify any Cindy file**, and it won't fill in the provider config for you
-(Cindy doesn't expose an interface for that). It gives you an endpoint; the last step is
-a few clicks in Cindy's UI.
+It manages its own plugin files and runtime data, **not Cindy's host installation receipt or provider configuration**. Add providers manually in Cindy; see the self-update limitations below.
 
 ## Requirements (check each one)
 
@@ -331,13 +319,14 @@ Just start Cindy normally. The plugin is `resident`, so Cindy pulls the worker u
 `47822` on its own. The token persists in `state.json` and the provider config lives in
 Cindy's own database — nothing else to manage.
 
-**Only these three cases need you:**
+**These cases need you:**
 
 1. Trae login expired → normally renews itself; if the refreshToken itself expired, sign
    in again in Trae CN and hit **Refresh** in the panel.
 2. Port `47822` taken by something else → the worker waits and retries, then falls through
    to `47823`…, and the panel's Base URL changes, so update it in Cindy.
 3. Uninstalling and reinstalling the plugin → you'll need to re-enter the provider.
+4. After self-update replaces runtime files → import the complete `.cindy` package through Cindy's native UI to refresh the host installation record.
 
 ## Model list
 
@@ -446,6 +435,18 @@ saved path (backslashes normalized, `%`/`#`/`?`/space percent-encoded). The plai
 path is also printed on its own line so you can copy it or open the file directly — use
 that if your renderer refuses `file://` sources.
 
+## Update safety and runtime boundaries
+
+- Updates require a matching, valid **64-hex-digit SHA-256**; size-only fallback is no longer accepted. Downloads require the exact GitHub HTTPS repo / tag / asset, allowlisted redirect domains, at most 5 redirects and a 32 MiB package limit.
+- The installer waits for the old PID to exit and stops without overwriting if it remains alive. After exit, it acquires OS-exclusive locks in the same fixed order, `INSTALL_DIR` (`install`) → `DATA_DIR` (`data`), and holds both throughout installation. After acquiring both locks, the installer validates the attempt identity in `latest-attempt.json`; a late script refuses to copy if the pointer has changed generation or is missing. Each journal attempt / result is persisted. Copy failures trigger rollback, which never overwrites the journal; failed rollback retains diagnostics and backups. `update-status` blocks boot after interrupted copy / rollback; journal `begin` and `applyUpdate` must not overwrite an unrecovered attempt pointer, and `begin` rejects a previous `handed_off` attempt. A pending handoff with no confirmed result blocks a new update: inspect `<install-dir>.updates/install.log` first. Automatic retry is not promised.
+- The persistent update directory is `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`: `<install-dir>.updates`, a sibling of the canonical install directory, not `update/` in the data directory. Bootstrap, worker and installer all check this journal independently of `DATA_DIR`; changing data directories cannot bypass it, and rollback never overwrites it.
+- **Recovery requires manual journal handling; native import alone does not unblock startup.** Cindy's native full `.cindy` package import does not clear this sibling journal. After interrupted copy / failed rollback, preserve all logs and backups. Import the complete package through Cindy's native UI and confirm success, then disable the plugin, **rename and retain for diagnosis** `<install-dir>.updates/latest-attempt.json`, and re-enable the plugin. Do not delete backups or logs.
+- **Successful self-update means runtime files were replaced, not that Cindy's host installation record was refreshed.** Host installation snapshots are no longer synchronized automatically. The updater neither writes `ghost-install-state` receipts directly nor invokes a sync script through `process.execPath`. Cindy 0.1.128 has no verified public API for plugins to write their own receipts. **Import the complete `.cindy` package using Cindy's native plugin UI** to refresh that record.
+- Manifest `node.entry` is `node/bootstrap.cjs`. It acquires OS-exclusive locks in the fixed order `INSTALL_DIR` (`install`) → `DATA_DIR` (`data`) before loading any business modules / worker. Windows uses named pipes; Linux abstract sockets are for offline CI only, not Linux runtime support. **The same install directory cannot run concurrently even with different data directories; different ports cannot share a data directory either. Multiple instances require both different install directories and different data directories.**
+- Adapter stream errors use the worker's Chinese `formatError` classification, retain received usage and terminate as failure rather than successful completion.
+- Cindy 0.1.128 loads the Node entry through `require`; bootstrap compatibility with that loading method has been verified. This does not mean this round's changes are released or installed. Windows fault tests use real temporary directories, **not an actual plugin installation**. No real-user login / logout testing was performed. Passing tests do not imply bug-free operation or expanded permissions.
+- Account endpoints use `trae-api-cn.mchost.guru` and `api.trae.cn`; update checks also use the GitHub API and downloads use allowlisted GitHub Release domains. Image retrieval uses a bare GET to the signed image URL returned upstream.
+
 ## Where runtime data lives
 
 | Path | Contents |
@@ -455,7 +456,7 @@ that if your renderer refuses `file://` sources.
 | `%APPDATA%\CindyGlobal\trae-bridge\models.json` | Model catalog cache (30 minutes) |
 | `%APPDATA%\CindyGlobal\trae-bridge\usage.json` | Local usage ledger (per day per model, kept 60 days, atomic writes) |
 | `%APPDATA%\CindyGlobal\trae-bridge\images\` | Images produced by `trae_draw_image` |
-| `%APPDATA%\CindyGlobal\trae-bridge\update\` | Self-update packages, staging dirs and replace script |
+| `<install-dir>.updates/` (`UPDATE_DIR`) | Persistent update journal, `latest-attempt.json`, `install.log`, downloaded packages, staging dirs and replace script; sibling of the install directory, independent of the data directory |
 | `%APPDATA%\CindyGlobal\trae-bridge\bridge.log` | Runtime log with ISO timestamps, rotates to `.1` past 2 MB |
 
 **Your Trae token is never written to any of these files** — it's decrypted fresh from the
@@ -484,24 +485,32 @@ regression.
 cd plugin && npm run verify     :: static manifest validation
 cd plugin && npm run pack       :: build the package
 
-node test\host-guard.js         :: Host guard, 13 cases (local, no login)
-node test\responses-status.js   :: Responses status mapping, 19 cases (local, no login)
-node test\upstream-contract.js  :: upstream contract, 16 cases (local: interleaved tool fragments / truncation / usage)
-node test\update-chain.js       :: self-update chain, 52 cases (local: version compare / digest fail-closed / unzip / rollback script)
-node test\review-regressions.js :: past review regressions, 46 cases (local: quota tolerance / credential generation / error mapping / package identity)
-node test\feature-offline.js    :: image params, response parsing, DeviceProof string, image URL, 39 cases (local, no quota)
-node test\e2e-package.js        :: package end-to-end, 25 cases (unzip -> start worker -> real chat -> three protocols -> license files)
-node test\e2e-panel.js          :: panel script, 17 cases
-node test\e2e-brain.js          :: panel <-> brain over a real bus, 13 cases
-node test\smoke-protocols.js    :: three protocol shapes, 19 cases
-node test\smoke-tools.js        :: tool calls across three protocols, 11 cases
-node test\wire-quirks.js        :: Cindy's /v1/v1 and [1m] quirks, 10 cases
-node test\features.js           :: effort / context / price factor / quota / error codes / input validation, 51 cases
+node test\host-guard.js
+node test\responses-status.js
+node test\upstream-contract.js
+node test\update-chain.js
+node test\review-regressions.js
+node test\feature-offline.js
+node test\protocol-defaults-reasoning.js :: protocol defaults and Responses reasoning regression
+node test\bootstrap.js              :: offline: lock before loading business modules
+node test\ownership.js              :: install- and data-directory locks
+node test\update-download.js        :: download restrictions
+node test\update-install-results.js :: installer faults and result persistence
+node test\update-status.js          :: interrupted updates and boot guards
+node test\e2e-package.js
+node test\e2e-panel.js
+node test\e2e-brain.js
+node test\smoke-protocols.js
+node test\smoke-tools.js
+node test\wire-quirks.js
+node test\features.js
+node .github\scripts\ci-run.cjs --mode offline :: offline CI orchestration
 ```
 
 To switch models: `node test\smoke-protocols.js <model id>` (defaults to
-`deepseek-v4.1-flash`). Each test opens its own temp directory and port so it won't
-collide with a running instance.
+`deepseek-v4.1-flash`). Isolated tests use temporary install copies, temporary data directories and independent ports, sharing neither install nor data directories with running instances. `test/bootstrap.js` is registered as offline and checks that business modules / worker are not loaded before both locks are acquired and that directory conflicts reject startup. It needs no login or real installation and is not actual plugin-installation verification.
+
+This round adds `test/protocol-defaults-reasoning.js`. The code is complete, awaiting final validation, and not released / installed. Use the actual output of `node .github/scripts/ci-run.cjs --mode offline` and the individual commands above for results and counts, not fixed assertion totals. Not run / SKIP does not mean passed.
 
 **Why the tests look like this**: every one of them guards a specific production incident.
 `host-guard` guards against Cindy's proxy stripping the port from the Host header (which
@@ -518,7 +527,7 @@ swallowing real usage. `feature-offline` pins the measured constraints: the mand
 you `20403`), and the flat image response shape. `update-chain` guards the self-update
 path: `0.1.15` sorting newer than `0.1.9`, a package whose sha256 doesn't match the release
 digest being rejected before a single byte touches the install directory, and the generated
-PowerShell waiting for the old process, backing up, then syncing Cindy's manifest snapshot.
+PowerShell waiting for the old process, backing up, recording the result and rolling back on copy failure. It does not sync Cindy's host installation snapshot.
 
 ## Local endpoint
 
@@ -592,16 +601,7 @@ tool names, and create a single point of failure.
   route" stays; the price factor can only live in the model name and the panel.
 - **Depends on Trae's internal endpoints.** When upstream changes, the plugin breaks. This
   is not a "long-term stable" thing.
-- **Omitting `stream` returns a streaming response**, the opposite of the three official
-  protocol defaults (non-streaming). Deliberate compatibility trade-off: Cindy's Anthropic
-  probe omits `stream` and parses the reply as `text/event-stream`, so the official default
-  would make it report the endpoint as incompatible. Pass `stream: false` explicitly if you
-  want a non-streaming reply. See issue #7.
-- **The Responses protocol drops reasoning content.** With a reasoning model over
-  `/v1/responses`, the output contains no `reasoning` item, yet usage still reports
-  `reasoning_tokens`. The Anthropic and Chat paths pass reasoning through correctly; only
-  Responses is missing it. Fixing it requires deciding the output shape first (`reasoning`
-  item vs summary text). See issue #12.
+- **Protocol compatibility change in this round (code complete, awaiting final validation, not released / installed):** old issues #7 (stream defaults) and #12 (Responses reasoning) are included in this round's remaining issue scope, not deferred. All three protocols return SSE only for `stream === true`; omitted or `false` returns one JSON response. Upstream may still use `stream: true` and be aggregated. Streaming and non-streaming Responses provide reasoning items containing `summary_text`; streaming uses standard `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` events. Only actual upstream reasoning and usage are forwarded, never fabricated. Callers relying on the old streaming default must explicitly send `stream: true`. Do not assume these changes are available in the installed release.
 - **A credential format change breaks it.** The proprietary AES wrapper is
   reverse-engineered; when Trae changes encryption (or rotates the salt), the plugin must be
   updated before it works again.
@@ -613,11 +613,7 @@ machine. You are responsible for complying with Trae's terms of service; the aut
 no liability for consequences of use. This project is not affiliated with, authorized by,
 or endorsed by Trae (ByteDance) or Cindy.
 
-Every request the plugin makes except **daily check-in** is **read-only**. Check-in is the
-only operation that changes anything on your Trae account (claiming credits Trae is already
-offering **to your own account**), it never runs automatically, and it always requires a
-manual click. Whether you use it — and whether it complies with Trae's current terms — is
-your call.
+Check-in claims credits offered **to your own account**, image generation spends credits, and credential renewal exchanges tokens; these requests are not read-only. Check-in never runs automatically, and image generation requires an explicit tool call. Whether you use these features — and whether they comply with Trae's current terms — is your call.
 
 To be explicit about the risks:
 

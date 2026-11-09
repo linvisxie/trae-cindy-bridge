@@ -170,15 +170,7 @@ GET  <签名 URL>                              裸 GET，不带任何 Trae 头
 
 ### 自查更新
 
-面板「检查更新」按钮 / 工具 `trae_update`。读 GitHub Releases 的 REST 接口（公开仓库匿名可读，不依赖 gh CLI、不需要代理配置），比对 `ghost.json` 里的版本号，有新包就下载解到 `update/stage-<版本>`，然后交给一个 detached PowerShell 脚本：
-
-```
-Wait-Process -Id <当前 worker pid>   → 等自己退出
-Copy-Item <安装目录> <安装目录>.bak-<旧版本>  （仅在备份不存在时）
-Copy-Item stage\* <安装目录> -Recurse -Force
-```
-
-**为什么不能在本进程里直接覆盖**：Windows 上正在运行的 `.js` 被锁，自己覆盖自己一定 `EBUSY`／`EPERM`。Cindy 检测到 worker 退出后约 24 秒用新文件重新拉起。
+面板「检查更新」按钮 / 工具 `trae_update` 读取 GitHub Releases，比对版本，验证下载包后暂存，再交给 detached PowerShell 安装器。安装器必须等旧 worker 退出后才备份、覆盖；旧进程未退出就停止。不能依赖固定重启时间或假设覆盖一定成功，故障与宿主记录处理见下文「更新安全与运行边界」。
 
 ### 额度与签到
 
@@ -191,7 +183,7 @@ Copy-Item stage\* <安装目录> -Recurse -Force
 | `/trae/api/v2/ug/checkin_credits/claim` | 领。需要 `x-device-id`，按**北京日期**幂等 |
 | `/trae/api/v2/ug/activity/info` | 活动信息 |
 
-签到是**唯一**会对账号产生变更的调用（领取 Trae 正在向你自己的账号发放的积分），不会自动执行。
+签到领取 Trae 向你自己账号发放的积分，不会自动执行；文生图也会消耗账号积分，凭据续期会换票，不能称签到为唯一的非只读调用。
 
 ### 三种协议
 
@@ -206,18 +198,22 @@ Copy-Item stage\* <安装目录> -Recurse -Force
 
 **为什么非要三种都有**：Cindy 的 `claude-code` 引擎只接 `anthropic-messages`，`codex` 引擎只接 `openai-responses`。只给 `chat/completions` 的话，供应商里就只剩 `pi` 一个引擎能选 —— 那等于把这个桥的价值砍掉大半。
 
-### 四个组件
+### 主要组件
 
 | 文件 | 角色 |
 |---|---|
 | `plugin/main.js` | 电子脑：把 AI 的工具调用与面板请求转给 worker |
+| `plugin/node/bootstrap.cjs` | 清单 `node.entry`（`node/bootstrap.cjs`）：先取得安装目录与数据目录双锁，再加载全部业务模块 / worker |
 | `plugin/node/worker.cjs` | Node 常驻进程：起 HTTP 服务、三条协议路由、端口咬死、用量账本 |
 | `plugin/node/trae.cjs` | Trae 上游客户端：解密登录态、请求头、请求体整形、SSE 解码、模型目录、额度签到 |
 | `plugin/node/adapters.cjs` | Anthropic / Responses 与 OpenAI Chat 之间的协议翻译 |
 | `plugin/node/update.cjs` | 自更新纯函数：版本比较、digest 校验、zip 解包、脚本生成 |
+| `plugin/node/download.cjs` | 限制更新下载地址、重定向与包大小 |
+| `plugin/node/ownership.cjs` | 安装目录与运行数据目录的 OS 独占所有权 |
+| `plugin/node/update-status.cjs` | 更新 journal attempt / result 与中断恢复启动检查 |
 | `plugin/panel.*` | 右侧栏面板：账号、额度、签到、模型列表、Base URL / Token |
 
-它**不改 Cindy 的任何文件**，也不替你填供应商配置（Cindy 没给插件这个接口）。它就是给你一个端点，剩下那步在 Cindy 界面里点。
+它只管理自身插件文件与运行数据，**不直接修改 Cindy 的宿主安装收据或供应商配置**。供应商仍需在 Cindy 界面手动添加；自更新与宿主安装记录的区别见下文。
 
 ## 环境依赖（请逐条核对）
 
@@ -290,11 +286,12 @@ Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）�
 
 正常启动 Cindy 就行。插件是 `resident`，Cindy 起来自己把 worker 拉到 `47822`；token 持久化在 `state.json`，供应商配置存在 Cindy 自己的数据库里，都不用再管。
 
-**只有这三种情况需要你动手：**
+**以下情况需要你动手：**
 
 1. Trae 登录过期 → 在 Trae CN 客户端重新登录，然后点面板上的「刷新」。
 2. 卸载重装插件 → 供应商要重新填一次。
 3. `47822` 被**别的软件**占了 → 才需要改端口（见下面「端口为什么咬死」）。
+4. 自更新替换运行文件后 → 用 Cindy 原生导入完整 `.cindy` 包刷新宿主安装记录。
 
 ## 模型列表
 
@@ -432,6 +429,17 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 - **登录态读不到 / 解不开** → 面板红点 + 提示「先打开 Trae CN 登录一次，然后点刷新」。Trae 改过加密格式时也会走到这里，此时只能等插件跟进。
 - **本地 Token 不对** → `401`，提示「面板上那串 Token 要一字不差地填进 Cindy 的 API Key 栏」。
 
+## 更新安全与运行边界
+
+- 更新必须提供合法的 **64 位十六进制 SHA-256** 并匹配包内容，不再降级成仅比较 size。下载仅接受本仓库指定 repo / tag / asset 的 GitHub HTTPS 地址；重定向逐跳检查允许域名，最多 5 跳，包上限 32 MiB。
+- 安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/install.log`，不保证自动重试。
+- 持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查这里的 journal，与 `DATA_DIR` 无关，换数据目录不能绕过，rollback 也不覆盖它。
+- **中断恢复需手动处理 journal，原生导入不会自动解除阻断。** Cindy 原生导入完整 `.cindy` 包不会清除安装目录同级的 journal。中断 copy / rollback 失败后，保留所有日志与 backup；通过 Cindy 原生导入完整包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` **重命名保留诊断**，再启用插件。不要删除备份和日志。
+- **自更新成功仅表示插件运行文件替换成功，不代表 Cindy 的宿主安装记录已刷新。** 不再自动同步宿主安装快照，也不直接写 `ghost-install-state` 安装收据或通过 `process.execPath` 执行同步脚本。Cindy 0.1.128 尚无已验证的公开插件自写收据 API；请通过 **Cindy 插件页原生导入完整 `.cindy` 包**刷新安装记录。
+- 清单 `node.entry` 为 `node/bootstrap.cjs`：先按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，之后才加载全部业务模块 / worker。Windows 使用命名管道，Linux abstract socket 仅用于 offline CI，不代表支持 Linux 运行插件。**同一安装目录即使数据目录不同也拒绝同时运行；不同端口也不能共享数据目录。多实例的安装目录和数据目录必须都不同。**
+- 适配器流中错误使用 worker 的 `formatError` 中文分类，保留已获 usage，并按失败终止，不伪装成正常完成。
+- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；这不等于本轮改动已发布或安装。本轮 Windows 故障验证使用真实临时目录，**不是真实插件安装验证**；没有真实用户登录 / 退出测试。测试通过不代表无 bug，也不扩大原有权限。
+
 ## 运行数据在哪
 
 | 路径 | 内容 |
@@ -441,7 +449,7 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 | `%APPDATA%\CindyGlobal\trae-bridge\models.json` | 模型目录缓存（30 分钟） |
 | `%APPDATA%\CindyGlobal\trae-bridge\usage.json` | 本地用量账本（按天按模型，留 60 天，原子写） |
 | `%APPDATA%\CindyGlobal\trae-bridge\images\` | `trae_draw_image` 生成的图片 |
-| `%APPDATA%\CindyGlobal\trae-bridge\update\` | 自查更新的下载包、暂存目录与替换脚本 |
+| `<安装目录>.updates/`（`UPDATE_DIR`） | 安装目录同级的持久更新 journal、`latest-attempt.json`、`install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
 | `%APPDATA%\CindyGlobal\trae-bridge\bridge.log` | 运行日志，带 ISO 时间戳，超 2 MB 自动滚成 `.1` |
 
 **你的 Trae token 不会被写进这些文件** —— 每次都是现从 Trae 客户端目录里的 `storage.json` 解密，只在内存里用。
@@ -463,23 +471,31 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 cd plugin && npm run verify     :: 清单静态校验
 cd plugin && npm run pack       :: 打包
 
-node test\host-guard.js         :: Host 守卫 13 项（纯本地，不需要登录）
-node test\responses-status.js   :: Responses 状态映射 19 项（纯本地，不需要登录）
-node test\upstream-contract.js  :: 上游契约 16 项（纯本地：交错工具分片 / 截断判定 / usage 回传）
-node test\update-chain.js       :: 自更新链路 52 项（纯本地：版本比较 / digest fail-closed / 解包 / 回滚脚本生成）
-node test\review-regressions.js :: 历次复审行为回归 46 项（纯本地：额度容错 / 凭据代次 / 错误映射 / 打包身份校验）
-node test\feature-offline.js    :: 文生图参数 / 应答解析 / DeviceProof 串 / 图片 URL 39 项（纯本地，不花额度）
-node test\e2e-package.js        :: 包端到端 25 项（解包 → 起 worker → 真对话 → 三条协议 → 许可文件）
-node test\e2e-panel.js          :: 面板脚本 17 项
-node test\e2e-brain.js          :: 面板 ↔ 电子脑真实总线 13 项
-node test\smoke-protocols.js    :: 三条协议形状 19 项
-node test\smoke-tools.js        :: 三条协议的 tool call 11 项
-node test\wire-quirks.js        :: Cindy 的 /v1/v1 与 [1m] 怪癖 10 项
-node test\features.js           :: 档位 / 上下文 / 倍率 / 额度 / 错误码 / 输入校验 51 项
+node test\host-guard.js
+node test\responses-status.js
+node test\upstream-contract.js
+node test\update-chain.js
+node test\review-regressions.js
+node test\feature-offline.js
+node test\protocol-defaults-reasoning.js :: 协议默认值与 Responses reasoning 回归
+node test\bootstrap.js              :: offline：加锁后才加载业务模块
+node test\ownership.js              :: 安装目录与数据目录双锁
+node test\update-download.js        :: 下载限制
+node test\update-install-results.js :: 安装故障与结果记录
+node test\update-status.js          :: 更新中断与启动阻断
+node test\e2e-package.js
+node test\e2e-panel.js
+node test\e2e-brain.js
+node test\smoke-protocols.js
+node test\smoke-tools.js
+node test\wire-quirks.js
+node test\features.js
 ```
 
 想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `deepseek-v4.1-flash`）。
-每个测试自己开临时目录与独立端口，不会踩到正在跑的实例。
+隔离测试使用临时安装副本、临时数据目录与独立端口，不与正在运行的实例共享安装目录或数据目录。`test/bootstrap.js` 登记为 offline，验证双锁取得前不加载业务模块 / worker，以及目录冲突拒绝启动；不需要登录态或真实安装，也不代表真实插件安装验证。
+
+本轮新增 `test/protocol-defaults-reasoning.js`；代码完成，待最终验证，尚未发布 / 安装。测试结果与统计以 `node .github/scripts/ci-run.cjs --mode offline` 及上述单项命令的实际输出为准，不固定断言数；未运行 / SKIP 不等于通过。
 
 ### CI 跑哪些、哪些只能在本地跑
 
@@ -519,7 +535,7 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 1. **只在本机回环上监听**。`127.0.0.1:47822`，局域网和公网都碰不到。
 2. **凭据不落盘**。`storage.json` 是现读现解，解密结果只活在 worker 进程内存里，进程退了就没了。
 3. **`/healthz` 不鉴权但不泄露**。只回 `{ok, port, modelCount}`，任何能连上 loopback 的进程拿到这三个字段也没用。
-4. **网络出口只有两个域名**：`trae-api-cn.mchost.guru`（对话与模型目录）、`api.trae.cn`（额度与签到）。
+4. **网络出口**：账号接口使用 `trae-api-cn.mchost.guru`（对话与模型目录）、`api.trae.cn`（额度与签到等）；检查更新还访问 GitHub API，更新下载访问经允许列表校验的 GitHub Release 域名；文生图还会裸 GET 上游返回的签名图片 URL。
 5. **不收集、不上传**聊天内容、token 或账号信息。没有遥测。
 6. **日志里会留运行痕迹**。`bridge.log` 会记请求路径、模型名、错误码与耗时，不记消息正文。分享日志前先自己看一眼。
 
@@ -553,14 +569,13 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 - **Cindy 详情页的「报价」修不掉**。自定义供应商的模型解析器不读 `displayPricing` / `currency` / `cost` 任何字段，所以那句「该路由没有报价数据」删不掉；倍率只能写在模型名里和面板上。
 - **依赖 Trae 的内部接口**。上游一改，插件就失效。这不是「长期稳定」的东西。
 - **凭据格式一改就挂**。自有 AES 封装是逆向出来的，Trae 换加密方式（或者换 salt）之后必须先更新插件才能用。
-- **省略 `stream` 时按流式返回**，与三份官方协议的默认值（非流式）相反。这是刻意的兼容取舍：Cindy 的 Anthropic 接入探测不传 `stream` 字段，且按 `text/event-stream` 解析响应；若改成官方语义，保存供应商的探测会直接判定「接入不兼容」。标准 SDK 想拿非流式响应，显式传 `stream: false` 即可。详见 issue #7。
-- **Responses 协议不输出推理内容**。经 `/v1/responses` 用推理模型时，正文里没有 `reasoning` 输出项，但 usage 仍照常上报 `reasoning_tokens`。Anthropic 与 Chat 两条链路会正常透传推理内容，只有 Responses 这条缺。修复需要先定输出形态（`reasoning` 输出项 vs summary 文本），详见 issue #12。
+- **本轮协议兼容性行为变更（代码完成，待最终验证，尚未发布 / 安装）**：旧 issue #7（stream 默认值）与 #12（Responses reasoning）同属本轮剩余问题范围，不再暂缓。三协议仅在 `stream === true` 时返回 SSE；缺省或 `false` 返回单个 JSON。上游仍可使用 `stream: true` 再聚合。Responses 流式 / 非流式提供含 `summary_text` 的 reasoning item；流式使用标准 `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` 事件，只传递真实上游推理内容与 usage，不虚构。依赖旧默认流式行为的调用方需显式传 `stream: true`；尚不能将本轮行为视为已安装版本的能力。
 
 ## 免责声明
 
 仅供个人学习研究使用，仅驱动使用者自己的 Trae 账号在本机调用。使用者需遵守 Trae 的服务条款，因使用本项目产生的后果由使用者自行承担。本项目与 Trae、Cindy 均无关联，也未获得其授权或认可。
 
-插件除「每日签到」外的所有请求都是**只读**的；签到是它唯一会对 Trae 账号产生变更的操作（领取 Trae 正在向**你自己的账号**发放的额度），它不会自动执行，每次都要手动点击。是否使用它、以及它是否符合 Trae 当前的服务条款，请自行判断。
+签到会领取 Trae 向**你自己的账号**发放的额度，文生图会消耗账号积分，凭据续期会换票；不能把这些请求称为只读。签到不会自动执行，文生图需显式调用工具。是否使用它、以及它是否符合 Trae 当前的服务条款，请自行判断。
 
 具体说清楚风险：
 

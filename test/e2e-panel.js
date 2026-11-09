@@ -10,7 +10,7 @@ const os = require('node:os');
 const vm = require('node:vm');
 
 const ROOT = join(__dirname, '..');
-const WORKER = join(ROOT, 'plugin', 'node', 'worker.cjs');
+const WORKER = join(ROOT, 'plugin', 'node', 'bootstrap.cjs');
 const PANEL_JS = join(ROOT, 'plugin', 'panel.js');
 const PANEL_HTML = join(ROOT, 'plugin', 'panel.html');
 

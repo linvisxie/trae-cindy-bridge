@@ -7,6 +7,11 @@
 // Anthropic 兼容服务」该长什么样。中间那条边界就是 chat.chunk —— 和 trae 上游桥同一套骨架。
 'use strict';
 
+const bootstrapOwners = globalThis.__CINDY_BRIDGE_OWNERSHIP;
+if (!bootstrapOwners?.installation?.held || !bootstrapOwners?.data?.held) {
+  throw new Error('必须通过 node/bootstrap.cjs 取得安装目录和数据目录独占权后启动。');
+}
+
 const http = require('node:http');
 const os = require('node:os');
 const zlib = require('node:zlib');
@@ -18,6 +23,9 @@ const { randomUUID } = require('node:crypto');
 const adapters = require('./adapters.cjs');
 const trae = require('./trae.cjs');
 const updater = require('./update.cjs');
+const { pipeName } = require('./ownership.cjs');
+const download = require('./download.cjs');
+const updateStatus = require('./update-status.cjs');
 
 // ============================================================
 // 运行时状态
@@ -26,6 +34,15 @@ const updater = require('./update.cjs');
 const DATA_DIR = process.env.CINDY_TRAE_DATA || join(os.homedir(), 'AppData', 'Roaming', 'CindyGlobal', 'trae-bridge');
 const PREFERRED_PORT = Number(process.env.CINDY_TRAE_PORT || 47822);
 const STATE_FILE = join(DATA_DIR, 'state.json');
+const dataOwnership = bootstrapOwners.data;
+async function ensureOwnership() {
+  assertOwnership();
+  return dataOwnership;
+}
+function assertOwnership() {
+  bootstrapOwners.installation.assertHeld();
+  dataOwnership.assertHeld();
+}
 const REGION_ID = 'trae-cn';
 
 let credential;
@@ -71,6 +88,7 @@ const MAX_BODY_BYTES = 20 * 1024 * 1024;
 // Cindy 只把 node worker 的 stderr 挂到自己那儿，重启就没了。这里同时落一份盘，
 // 出问题能翻历史；超过 2MB 就轮转成 bridge.log.1，不会无限长。
 function writeLogFile(line) {
+  if (!dataOwnership?.held) return; // Contenders log only to stderr.
   try {
     mkdirSync(DATA_DIR, { recursive: true });
     try {
@@ -95,9 +113,10 @@ function loadState() {
 }
 
 function saveState(patch) {
+  assertOwnership();
   try {
     mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify({ ...loadState(), ...patch }, null, 1));
+    writeJsonAtomic(STATE_FILE, { ...loadState(), ...patch });
   } catch (e) { log('state write failed', e.message); }
 }
 
@@ -219,6 +238,7 @@ function normalizeModel(m) {
 }
 
 async function refreshModels(force) {
+  assertOwnership();
   if (!force && models.length && Date.now() - modelsAt < 30 * 60 * 1000) return models;
   const cache = join(DATA_DIR, 'models.json');
   const cred = await refreshCredential(force);
@@ -380,15 +400,13 @@ function writeJsonAtomic(file, value) {
   writeFileSync(tmp, JSON.stringify(value, null, 1));
   try { renameSync(tmp, file); }
   catch (e) {
-    // Windows 上目标被别的进程短暂占住时 rename 会失败，退回直写再清临时文件
-    try { writeFileSync(file, JSON.stringify(value, null, 1)); } finally {
-      try { unlinkSync(tmp); } catch {}
-    }
-    if (e && e.code !== 'EPERM' && e.code !== 'EACCES' && e.code !== 'EBUSY') throw e;
+    try { unlinkSync(tmp); } catch {}
+    throw e;
   }
 }
 
 function recordUsage(entry, wire, tokensIn, tokensOut) {
+  assertOwnership();
   try {
     const book = loadUsageBook();
     const day = localDayKey(Date.now());
@@ -559,6 +577,19 @@ function humanizeUpstreamError(err) {
 
 // ---------- 请求翻译与校验 ----------
 
+function validateTools(tools, protocol) {
+  if (tools === undefined) return;
+  if (!Array.isArray(tools)) throw new Error('tools 必须是数组');
+  tools.forEach((tool, i) => {
+    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) throw new Error('第 ' + i + ' 个工具不是对象');
+    const supported = protocol === 'responses' ? tool.type === 'function' : tool.type === undefined || tool.type === 'custom';
+    if (!supported) throw new Error('不支持的工具类型：' + tool.type);
+    if (typeof tool.name !== 'string' || !tool.name.trim()) throw new Error('第 ' + i + ' 个工具缺 name');
+    const schema = protocol === 'responses' ? tool.parameters : tool.input_schema;
+    if (schema !== undefined && (!schema || typeof schema !== 'object' || Array.isArray(schema))) throw new Error('第 ' + i + ' 个工具 schema 必须是对象');
+  });
+}
+
 // 顺序很重要：畸形 tool 必须在查凭证之前就 400，否则「Trae 未登录」会盖住「你的
 // JSON Schema 写错了」，用户会去折腾登录。
 function toChatMessages(list) {
@@ -632,22 +663,14 @@ function isLoopbackAddr(a) {
   return s === '::1' || s === '127.0.0.1' || s.startsWith('127.') || s === '::ffff:127.0.0.1';
 }
 
-// 只放行 loopback。按 hostname 判，端口可有可无，[::1] 与 ::1 都认——带端口的前缀匹配
-// 会把不带默认端口的 Host（部分 SDK / 代理会去掉）误判成 403。
+// 校验完整 authority；端口可省略，IPv6 必须带方括号。
 function hostOk(req) {
   const raw = String(req.headers.host || '').toLowerCase().trim();
   if (!raw) return isLoopbackAddr(req.socket && req.socket.remoteAddress);
-  let hostname = raw;
-  if (hostname.startsWith('[')) {
-    const end = hostname.indexOf(']');
-    hostname = end !== -1 ? hostname.slice(0, end + 1) : hostname;
-  } else {
-    const colon = hostname.lastIndexOf(':');
-    if (colon !== -1 && hostname.indexOf(':') === colon) hostname = hostname.slice(0, colon);
-  }
-  if (!hostname) return false;
-  if (hostname === 'localhost' || hostname === '[::1]' || hostname === '::1') return true;
-  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+  const match = /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])(?::([0-9]+))?$/.exec(raw);
+  if (!match) return false;
+  if (match[2] !== undefined && (Number(match[2]) < 1 || Number(match[2]) > 65535)) return false;
+  return !match[1].startsWith('127.') || match[1].split('.').every(part => Number(part) <= 255);
 }
 
 function authOk(req) {
@@ -728,6 +751,7 @@ async function handle(req, res) {
     if (!parsed.ok) return;
     let chat;
     try {
+      validateTools(parsed.value && parsed.value.tools, 'anthropic');
       chat = adapters.anthropicRequestToChat(parsed.value);
     } catch (e) {
       sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
@@ -838,7 +862,7 @@ async function chatCompletions(req, res) {
   const cred = await refreshCredential(false);
   if (!cred) { sendJson(res, 401, { error: { message: notSignedInMessage() } }); return; }
 
-  const wantStream = payload.stream !== false;
+  const wantStream = payload.stream === true;
   const controller = new AbortController();
   const cancelOnClose = bindAbort(req, res, controller);
 
@@ -853,7 +877,7 @@ async function chatCompletions(req, res) {
   }
 
   if (!wantStream) {
-    const content = []; const calls = new Map(); let finish = 'stop'; let usage;
+    const content = []; const reasoning = []; const calls = new Map(); let finish = 'stop'; let usage;
     try {
       for (let s = first; !s.done; s = await iterator.next()) {
       const c = s.value;
@@ -862,6 +886,8 @@ async function chatCompletions(req, res) {
       if (!ch) continue;
       const d = ch.delta || ch.message || {};
       if (typeof d.content === 'string') content.push(d.content);
+      const r = d.reasoning_content ?? d.reasoning;
+      if (typeof r === 'string') reasoning.push(r);
       if (Array.isArray(d.tool_calls)) for (const t of d.tool_calls) {
         const i = t.index ?? 0;
         const cur = calls.get(i) || { id: t.id || '', type: 'function', function: { name: '', arguments: '' } };
@@ -883,6 +909,7 @@ async function chatCompletions(req, res) {
     }
     for (const cur of calls.values()) if (!cur.id) cur.id = `call_${crypto.randomBytes(6).toString('hex')}`;
     const message = { role: 'assistant', content: content.join('') };
+    if (reasoning.length) message.reasoning_content = reasoning.join('');
     if (calls.size) message.tool_calls = [...calls.values()];
     recordUsage(entry || { model: displayModel }, 'chat', usage?.prompt_tokens, usage?.completion_tokens);
     sendJson(res, 200, {
@@ -972,6 +999,7 @@ async function anthropicMessages(req, res) {
 
   let chat;
   try {
+    validateTools(parsed.value && parsed.value.tools, 'anthropic');
     chat = adapters.anthropicRequestToChat(parsed.value);
   } catch (e) {
     sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
@@ -1004,7 +1032,11 @@ async function anthropicMessages(req, res) {
   const up = await openUpstream(req, res, request, displayModel);
   if (!up.ok) return;
 
-  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
+  const opts = {
+    model: displayModel,
+    inputTokens: adapters.estimateTokens(chat.messages),
+    formatError: error => errorBodyOf(error).error,
+  };
   try {
     if (chat.stream) await adapters.writeAnthropicStream(res, up.first, up.iterator, opts);
     else {
@@ -1026,6 +1058,7 @@ async function openaiResponses(req, res) {
 
   let chat;
   try {
+    validateTools(parsed.value && parsed.value.tools, 'responses');
     chat = adapters.responsesRequestToChat(parsed.value);
   } catch (e) {
     sendJson(res, 400, { error: { message: `请求格式不对：${e.message}`, type: 'invalid_request_error' } });
@@ -1059,7 +1092,11 @@ async function openaiResponses(req, res) {
   const up = await openUpstream(req, res, request, displayModel);
   if (!up.ok) return;
 
-  const opts = { model: displayModel, inputTokens: adapters.estimateTokens(chat.messages) };
+  const opts = {
+    model: displayModel,
+    inputTokens: adapters.estimateTokens(chat.messages),
+    formatError: error => errorBodyOf(error).error,
+  };
   try {
     if (chat.stream) await adapters.writeResponsesStream(res, up.first, up.iterator, opts);
     else {
@@ -1154,7 +1191,15 @@ async function startServer() {
   log(`已在 127.0.0.1:${actualPort} 监听`);
 }
 
-async function boot() {
+let bootPending;
+function boot() {
+  if (!bootPending) bootPending = bootOwned().finally(() => { bootPending = undefined; });
+  return bootPending;
+}
+async function bootOwned() {
+  await ensureOwnership();
+  updateStatus.assertRecoverable(UPDATE_DIR);
+  if (actualPort) return;
   bootedAt = Date.now();
   mkdirSync(DATA_DIR, { recursive: true });
   const st = loadState();
@@ -1167,6 +1212,7 @@ async function boot() {
 }
 
 async function buildStatus() {
+  const updateResult = updateStatus.readLatest(UPDATE_DIR);
   const cred = await refreshCredential(false);
   if (!lastUsage || !lastCheckin) {
     const first = (async () => {
@@ -1199,6 +1245,7 @@ async function buildStatus() {
     checkin: { ...(lastCheckin || { active: false }), ...scheduled },
     localUsage: usageSummary(),
     logFile: LOG_FILE,
+    updateResult,
     sourcePath: identity && identity.storagePath ? identity.storagePath : undefined,
     uptimeSeconds: Math.floor((Date.now() - bootedAt) / 1000),
     // 只报还活着的错误（成功刷新会按来源清掉），并带上「多久以前」。
@@ -1219,8 +1266,8 @@ async function buildStatus() {
 
 const UPDATE_REPO = process.env.TRAE_BRIDGE_REPO || 'linvisxie/trae-cindy-bridge';
 const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
-const UPDATE_DIR = join(DATA_DIR, 'update');
 const INSTALL_DIR = join(__dirname, '..');
+const UPDATE_DIR = updateStatus.updateDirectory(INSTALL_DIR);
 
 // 版本比较、digest 校验、zip 解包、脚本生成都在 node/update.cjs ——
 // 那一份是纯函数、可以离线跑回归测试；这里只留需要 IO 的部分。
@@ -1275,13 +1322,28 @@ async function checkUpdate() {
 // 更新在途锁：面板连点或面板+工具两路同时喊 applyUpdate 时，只允许一个真的下载安装，
 // 其余直接回「正在进行」。原来没有任何互斥，两次下载、两个安装脚本抢同一个安装目录是可能的。
 let updateInFlight = false;
+let activeUpdateAttempt;
 async function applyUpdate() {
+  await ensureOwnership();
+  updateStatus.assertRecoverable(UPDATE_DIR);
   if (updateInFlight) {
     return { applied: false, error: '更新已在进行中', message: '更新已在进行中，不用重复点，等它装完自动重启。' };
   }
   updateInFlight = true;
-  try { return await applyUpdateOnce(); }
-  finally { updateInFlight = false; }
+  let handedOff = false;
+  try {
+    const result = await applyUpdateOnce();
+    handedOff = result.applied === true;
+    return result;
+  } catch (error) {
+    if (activeUpdateAttempt) updateStatus.writeResult(activeUpdateAttempt, {
+      status: 'not_started', phase: 'failed', error: error.message,
+      hostReceipt: 'requires_host_install',
+    });
+    throw error;
+  } finally {
+    if (!handedOff) { updateInFlight = false; activeUpdateAttempt = undefined; }
+  }
 }
 
 async function applyUpdateOnce() {
@@ -1290,12 +1352,11 @@ async function applyUpdateOnce() {
   if (!info.asset) throw new Error('最新 release 里没有 .cindy 包，无法更新');
 
   mkdirSync(UPDATE_DIR, { recursive: true });
-  const res = await fetch(info.asset.url, {
-    headers: { 'User-Agent': 'trae-bridge' },
-    signal: AbortSignal.timeout(120000),
+  const attemptId = 'attempt-' + crypto.randomUUID();
+  activeUpdateAttempt = updateStatus.begin(UPDATE_DIR, attemptId, { version: info.latest, hostReceipt: 'requires_host_install' });
+  const bytes = await download.downloadReleaseAsset(info.asset, {
+    repo: UPDATE_REPO, version: info.latest, fetch, signal: AbortSignal.timeout(120000),
   });
-  if (!res.ok) throw new Error(`下载新版本失败：HTTP ${res.status}`);
-  const bytes = Buffer.from(await res.arrayBuffer());
 
   // 先验再落盘：校验不过就一个字节都不写进安装目录，当前版本继续跑。
   const check = updater.verifyDigest(bytes, info.asset.digest, info.asset.size);
@@ -1305,31 +1366,31 @@ async function applyUpdateOnce() {
   // A matching digest proves bytes, not plugin identity or runnable contents.
   updater.validatePackage(readZipEntries(bytes), {
     id: 'trae-bridge', version: info.latest, currentVersion: info.current,
-    required: ['node/adapters.cjs', 'node/update.cjs', 'node/trae.cjs'],
+    required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/trae.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs'],
   });
 
   const stageDir = mkdtempSync(join(UPDATE_DIR, 'stage-'));
   // Unique paths also isolate concurrent update attempts and stale staging files.
   const scriptPath = `${stageDir}.ps1`;
-  const syncScriptPath = `${stageDir}.cjs`;
   const packagePath = `${stageDir}.cindy`;
-  const backup = `${INSTALL_DIR}.bak-${info.current}`;
+  const backup = `${INSTALL_DIR}.bak-${info.current}-${attemptId}`;
   let child;
   try {
     writeFileSync(packagePath, bytes);
     extractZipTo(bytes, stageDir);
-    writeFileSync(syncScriptPath, updater.buildSnapshotSyncScript({ installDir: INSTALL_DIR, pkgPath: packagePath }), 'utf8');
     writeFileSync(scriptPath, updater.buildApplyScript({
-      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath,
-      syncScript: syncScriptPath, nodeExe: process.execPath, oldPid: process.pid,
+      root: INSTALL_DIR, stage: stageDir, backup, pkg: packagePath, oldPid: process.pid,
+      attemptDir: activeUpdateAttempt, latestPointer: join(UPDATE_DIR, 'latest-attempt.json'), installationPipe: pipeName(INSTALL_DIR, 'install'), ownershipPipe: pipeName(DATA_DIR),
     }), 'utf8');
+    updateStatus.writeResult(activeUpdateAttempt, { status: 'handed_off', phase: 'waiting',
+      version: info.latest, backup, hostReceipt: 'requires_host_install' });
     child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
       detached: true, stdio: 'ignore', windowsHide: true,
     });
     await updater.waitForSpawn(child);
   } catch (e) {
     rmSync(stageDir, { recursive: true, force: true });
-    for (const file of [packagePath, scriptPath, syncScriptPath]) rmSync(file, { force: true });
+    for (const file of [packagePath, scriptPath]) rmSync(file, { force: true });
     throw new Error(`无法启动更新安装：${e.message}`);
   }
   child.unref();
@@ -1341,10 +1402,11 @@ async function applyUpdateOnce() {
 
   return {
     ...info,
-    applied: true,
+    applied: true, status: 'handed_off',
     backup,
     scriptPath,
-    message: `已下载 ${info.latest} 并成功启动后台安装脚本；worker 正在退出，Cindy 大约 20~30 秒后用新版本重新拉起。`,
+    resultPath: join(activeUpdateAttempt, 'result.json'),
+    message: `已下载 ${info.latest} 并交接安装器，尚不代表安装完成。最终结果见插件状态及 ${join(activeUpdateAttempt, 'result.json')}；宿主安装记录需通过 Cindy 原生导入完整包刷新。`,
   };
 }
 
@@ -1411,6 +1473,7 @@ rl.on('line', async (line) => {
   const method = req.method;
 
   try {
+    await ensureOwnership();
     let result;
     if (method === 'trae/status') {
       if (!server) await boot();

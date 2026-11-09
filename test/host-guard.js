@@ -14,7 +14,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 
-const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'worker.cjs');
+const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'bootstrap.cjs');
 const PORT = Number(process.env.HOST_GUARD_PORT || 47955);
 
 let pass = 0;
@@ -47,7 +47,7 @@ function request(hostHeader) {
 async function main() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'trae-hostguard-'));
   const child = spawn(process.execPath, [WORKER], {
-    env: { ...process.env, CINDY_TRAE_DATA: dataDir, CINDY_TRAE_PORT: String(PORT) },
+    env: { ...process.env, APPDATA: dataDir, LOCALAPPDATA: dataDir, USERPROFILE: dataDir, HOME: dataDir, CINDY_TRAE_DATA: dataDir, CINDY_TRAE_PORT: String(PORT) },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   child.stderr.on('data', () => {});
@@ -74,11 +74,14 @@ async function main() {
     'localhost:' + PORT,
     '[::1]',
     '[::1]:' + PORT,
-    '::1',
     '127.0.0.2',
   ];
   // 必须拒绝的
   const deny = [
+    '::1',
+    '[::1].evil.example',
+    '[::1]:65536',
+    '127.256.0.1',
     'example.com',
     'evil.com:' + PORT,
     '10.0.0.1:' + PORT,

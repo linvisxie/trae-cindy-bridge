@@ -151,6 +151,10 @@
     if (st.hint && (!signedIn || expired)) { $('hint').hidden = false; $('hint').textContent = st.hint; }
     else $('hint').hidden = true;
 
+    if (st.updateResult?.message && !$('checkUpdate').disabled) {
+      $('updateMsg').hidden = false;
+      $('updateMsg').textContent = st.updateResult.message;
+    }
     if (st.lastError) { $('err').hidden = false; $('err').textContent = st.lastError; }
     else $('err').hidden = true;
 

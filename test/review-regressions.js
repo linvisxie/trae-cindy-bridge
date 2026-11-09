@@ -21,11 +21,25 @@ function worker(options = {}) {
   const baseRequire = createRequire(file);
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'bridge-review-'));
   temporary.push(dir);
-  const launches = [], exits = [];
+  const launches = [], exits = [], ownershipCalls = [];
+  const owner = {
+    held: true,
+    assertHeld() { if (!this.held) throw new Error('fixture ownership lost'); },
+  };
+  const installation = { ...owner };
   const ctx = vm.createContext({
+    __CINDY_BRIDGE_OWNERSHIP: options.unowned ? undefined : { installation, data: owner },
     __dirname: path.dirname(file), Buffer, URL, TextDecoder, AbortController, AbortSignal,
+    fetch: async () => { throw new Error('unexpected fixture fetch'); },
     require(id) {
-      if (id === './trae.cjs' && options.trae) return options.trae;
+      if (id === './update-status.cjs') return { ...baseRequire(id), updateDirectory: () => path.join(dir, 'update') };
+      if (id === './ownership.cjs') return { pipeName: (_directory, scope = 'data') => '\\\\.\\pipe\\fixture-' + scope, async acquireOwnership(directory) {
+        ownershipCalls.push(directory);
+        throw new Error('worker must not acquire ownership');
+      } };
+      if (id === './trae.cjs') return options.trae || {
+        ...baseRequire(id), readTraeCredential: () => ({ ok: false, reason: 'not-found' }),
+      };
       if (id === 'node:fs' && options.fs) return { ...baseRequire(id), ...options.fs };
       if (id === 'node:child_process') return {
         ...baseRequire(id),
@@ -39,7 +53,7 @@ function worker(options = {}) {
       return baseRequire(id);
     },
     process: {
-      env: { ...process.env, CINDY_QODER_DATA: dir, CINDY_TRAE_DATA: dir },
+      env: { ...process.env, APPDATA: dir, LOCALAPPDATA: dir, USERPROFILE: dir, HOME: dir, CINDY_QODER_DATA: dir, CINDY_TRAE_DATA: dir },
       stderr: { write() {} }, platform: process.platform, arch: process.arch,
       pid: process.pid, execPath: process.execPath, exit() { throw new Error('test must not exit worker'); },
     },
@@ -48,8 +62,35 @@ function worker(options = {}) {
   });
   // Retain the real implementation, omit resident boot and stdio event registration.
   vm.runInContext(fs.readFileSync(file, 'utf8').split('// JSON-RPC over stdio')[0], ctx, { filename: file });
-  return { ctx, dir, launches, exits, run: (source) => vm.runInContext(source, ctx) };
+  return { ctx, dir, launches, exits, owner, installation, ownershipCalls, run: (source) => vm.runInContext(source, ctx) };
 }
+
+test('worker requires both bootstrap owners and never acquires ownership itself', async () => {
+  const w = worker();
+  await Promise.all([w.run('ensureOwnership()'), w.run('ensureOwnership()')]);
+  assert.deepEqual(w.ownershipCalls, []);
+  w.run('saveState({fixture:true})');
+  for (const owner of [w.installation, w.owner]) {
+    owner.held = false;
+    await assert.rejects(w.run('ensureOwnership()'), /ownership|required|lost/i);
+    assert.throws(() => w.run('saveState({fixture:false})'), /ownership|required|lost/i);
+    owner.held = true;
+    const heldAssertion = owner.assertHeld;
+    owner.assertHeld = () => { throw new Error('fixture ownership lost'); };
+    await assert.rejects(w.run('ensureOwnership()'), /ownership lost/);
+    owner.assertHeld = heldAssertion;
+  }
+  assert.equal(JSON.parse(fs.readFileSync(path.join(w.dir, 'state.json'))).fixture, true);
+  assert.throws(() => worker({ unowned: true }), /bootstrap|ownership|required/i);
+  const denied = worker();
+  denied.installation.held = false;
+  assert.throws(() => denied.run('saveState({fixture:true})'), /ownership|required|lost/i);
+  denied.run("refreshCredential=async()=>{throw Error('must not read credentials')};startServer=async()=>{throw Error('must not listen')}");
+  await assert.rejects(denied.run('boot()'), /ownership|required|lost/i);
+  assert.deepEqual(denied.ownershipCalls, []);
+  assert.deepEqual(fs.readdirSync(denied.dir), []);
+  assert.equal(denied.launches.length, 0);
+});
 
 async function request(w, route, body) {
   const req = Readable.from([Buffer.from(JSON.stringify(body))]);
@@ -88,10 +129,10 @@ for (const input of [123, 0]) for (const route of ['/v1/messages', '/v1/response
 
 const validManifest = { ...MANIFEST, version: '99.0.0' };
 function entries(manifest = validManifest) {
-  return ['ghost.json', 'main.js', 'panel.js', 'panel.html', 'node/worker.cjs', 'node/adapters.cjs', 'node/update.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])]
+  return ['ghost.json', 'main.js', 'panel.js', 'panel.html', 'node/worker.cjs', 'node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])]
     .map(name => ({ name, data: Buffer.from(name === 'ghost.json' ? JSON.stringify(manifest) : 'fixture') }));
 }
-const expected = { id: MANIFEST.id, version: '99.0.0', currentVersion: MANIFEST.version, required: ['node/adapters.cjs', 'node/update.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])] };
+const expected = { id: MANIFEST.id, version: '99.0.0', currentVersion: MANIFEST.version, required: ['node/bootstrap.cjs', 'node/adapters.cjs', 'node/update.cjs', 'node/ownership.cjs', 'node/download.cjs', 'node/update-status.cjs', ...(IS_TRAE ? ['node/trae.cjs'] : [])] };
 // Small ZIP writer for controlled updater fixtures (stored entries, valid CRC).
 function zip(list) {
   const local = [], central = []; let offset = 0;
@@ -110,10 +151,81 @@ function zip(list) {
   return Buffer.concat([...local,cd,end]);
 }
 function prepareUpdate(w, list) {
-  const bytes = zip(list); w.ctx.fetch = async () => ({ ok: true, arrayBuffer: async () => bytes });
-  w.ctx.asset = { name: 'fixture.cindy', url: 'https://invalid.example/fixture', size: bytes.length, digest: 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex') };
+  const bytes = zip(list);
+  const name = IS_TRAE ? 'trae-cindy-bridge.cindy' : 'cindy-qoder-bridge.cindy';
+  const url = `https://github.com/${w.run('UPDATE_REPO')}/releases/download/v99.0.0/${name}`;
+  w.ctx.fetch = async (requested, options) => {
+    assert.equal(requested, url); assert.equal(options.redirect, 'manual');
+    return new Response(bytes, { headers: { 'Content-Length': String(bytes.length) } });
+  };
+  w.ctx.asset = { name, url, size: bytes.length, digest: 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex') };
   w.run(`checkUpdate=async()=>({current:'${MANIFEST.version}',latest:'99.0.0',hasUpdate:true,asset})`);
 }
+
+for (const field of ['digest', 'size']) test(`update rejects incorrect ${field} before installer launch`, async () => {
+  const w = worker(); prepareUpdate(w, entries());
+  w.ctx.asset[field] = field === 'digest' ? 'sha256:' + '0'.repeat(64) : w.ctx.asset.size + 1;
+  await assert.rejects(w.run('applyUpdate()'));
+  assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
+});
+
+test('update recovery blocks unsafe journals before boot and permits safe outcomes', async () => {
+  const journal = require('../plugin/node/update-status.cjs');
+  for (const [status, phase, blocked] of [
+    ['rollback_failed','rolling_back',true], ['in_progress','copying',true],
+    ['in_progress','rolling_back',true], ['not_started','failed',false],
+    ['handed_off','waiting',false], ['rollback_succeeded','complete',false], ['success','complete',false],
+  ]) {
+    const w = worker(), dir = path.join(w.dir, 'update');
+    const attempt = journal.begin(dir, 'attempt-abc');
+    journal.writeResult(attempt, {status, phase});
+    w.run("actualPort=1;refreshCredential=async()=>{throw Error('unexpected credential read')}");
+    if (blocked) await assert.rejects(w.run('boot()'), /Cindy.*result\.json/);
+    else await w.run('boot()');
+    assert.equal(journal.readLatest(dir).status, status);
+  }
+  const w = worker(), dir = path.join(w.dir, 'update');
+  const attempt = journal.begin(dir, 'attempt-abc');
+  fs.writeFileSync(path.join(attempt, 'result.json'), 'broken JSON');
+  assert.equal(journal.readLatest(dir).status, 'unknown');
+  await assert.rejects(w.run('boot()'), /Cindy/);
+});
+
+for (const [status, phase] of [
+  ['in_progress', 'copying'], ['in_progress', 'rolling_back'],
+  ['rollback_failed', 'rolling_back'], ['unknown', 'unreadable'],
+]) test(`applyUpdate preserves unresolved ${status}/${phase} journal before any new attempt`, async () => {
+  const journal = require('../plugin/node/update-status.cjs');
+  const w = worker(), dir = path.join(w.dir, 'update');
+  const attempt = journal.begin(dir, 'attempt-abc');
+  journal.writeResult(attempt, { status, phase });
+  if (status === 'unknown') fs.writeFileSync(path.join(attempt, 'result.json'), 'broken JSON');
+  const pointer = fs.readFileSync(path.join(dir, 'latest-attempt.json'));
+  const result = fs.readFileSync(path.join(attempt, 'result.json'));
+  const contents = fs.readdirSync(dir).sort();
+  w.run("checkUpdate=async()=>{throw Error('must not check releases before recovery')}");
+  await assert.rejects(w.run('applyUpdate()'), /Cindy/);
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'latest-attempt.json')), pointer);
+  assert.deepEqual(fs.readFileSync(path.join(attempt, 'result.json')), result);
+  assert.deepEqual(fs.readdirSync(dir).sort(), contents);
+  assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
+});
+
+test('applyUpdate preserves pending handed_off journal without launching another installer', async () => {
+  const journal = require('../plugin/node/update-status.cjs');
+  const w = worker(), dir = path.join(w.dir, 'update');
+  prepareUpdate(w, entries());
+  const attempt = journal.begin(dir, 'attempt-abc');
+  journal.writeResult(attempt, { status: 'handed_off', phase: 'waiting' });
+  const pointer = fs.readFileSync(path.join(dir, 'latest-attempt.json'));
+  const result = fs.readFileSync(path.join(attempt, 'result.json'));
+  const contents = fs.readdirSync(dir).sort();
+  await assert.rejects(w.run('applyUpdate()'), /安装器|交接|pending|handed.off/i);
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'latest-attempt.json')), pointer);
+  assert.deepEqual(fs.readFileSync(path.join(attempt, 'result.json')), result);
+  assert.deepEqual(fs.readdirSync(dir).sort(), contents);
+  assert.equal(w.launches.length, 0); assert.equal(w.exits.length, 0);
+});
 
 test('valid package belongs to this plugin', () => { assert.equal(updater.validatePackage(entries(), expected).id, MANIFEST.id); });
 for (const [label, alter] of [
@@ -122,6 +234,8 @@ for (const [label, alter] of [
   ['non-JSON manifest', () => entries().map(e => e.name === 'ghost.json' ? { ...e, data: Buffer.from('not JSON') } : e)],
   ['missing main', () => entries().filter(e => e.name !== 'main.js')],
   ['missing worker', () => entries().filter(e => e.name !== 'node/worker.cjs')],
+  ['missing bootstrap', () => entries().filter(e => e.name !== 'node/bootstrap.cjs')],
+  ['missing owner', () => entries().filter(e => e.name !== 'node/ownership.cjs')],
   ['invalid declared entry', () => entries({ ...validManifest, entry: '../outside.js' })],
 ]) {
   test(`updater refuses ${label} before launching installer`, async () => {
@@ -134,12 +248,29 @@ for (const code of ['ENOENT', 'EACCES']) test(`installer ${code} leaves worker r
   const w = worker({ spawnError: Object.assign(new Error(code), { code }) }); prepareUpdate(w, entries());
   await assert.rejects(w.run('applyUpdate()'), new RegExp(code));
   assert.equal(w.launches.length, 1); assert.equal(w.exits.length, 0);
-  assert.deepEqual(fs.readdirSync(path.join(w.dir, 'update')), []);
+  const updateDir = path.join(w.dir, 'update');
+  const journal = require('../plugin/node/update-status.cjs').readLatest(updateDir);
+  assert.equal(journal.status, 'not_started'); assert.equal(journal.phase, 'failed');
+  assert.match(journal.error, new RegExp(code));
+  assert.equal(journal.hostReceipt, 'requires_host_install');
+  assert.ok(!fs.readdirSync(updateDir).some(name => name.startsWith('stage-')));
 });
 test('successful handoff retains update lock until exit', async () => {
   const w = worker(); prepareUpdate(w, entries());
-  const first = await w.run('applyUpdate()'), second = await w.run('applyUpdate()');
+  const first = await w.run('applyUpdate()');
+  const pointerPath = path.join(w.dir, 'update', 'latest-attempt.json');
+  const pointer = fs.readFileSync(pointerPath);
+  const second = await w.run('applyUpdate()');
   assert.equal(first.applied, true); assert.equal(second.applied, false);
+  assert.deepEqual(fs.readFileSync(pointerPath), pointer);
+  const script = fs.readFileSync(first.scriptPath, 'utf8');
+  assert.ok(script.includes("$installationPipe = '\\\\.\\pipe\\fixture-install'"));
+  assert.ok(script.includes("$ownershipPipe = '\\\\.\\pipe\\fixture-data'"));
+  assert.ok(script.includes('$latestPointer = ' + updater.psQuote(path.join(w.dir, 'update', 'latest-attempt.json'))));
+  const result = JSON.parse(fs.readFileSync(first.resultPath));
+  assert.equal(result.status, 'handed_off'); assert.equal(result.phase, 'waiting');
+  assert.equal(result.hostReceipt, 'requires_host_install');
+  assert.match(first.backup, /\.bak-.*-attempt-[a-f0-9-]+$/);
   assert.equal(w.exits.length, 1); assert.equal(w.launches.length, 1);
 });
 test('release selection uses exact plugin package name', async () => {
@@ -444,6 +575,49 @@ for (const route of ['/v1/messages', '/v1/responses']) test('partial usage survi
   const stats = Object.values(JSON.parse(fs.readFileSync(path.join(w.dir,'usage.json'))).days)[0].models.test;
   assert.equal(stats.in,123); assert.equal(stats.out,45);
 });
+
+// Exercise the real worker -> adapter streaming path, not a standalone adapter callback.
+for (const [status, upstreamCode, type] of [
+  [402, 4008, 'hard_credit'], [402, 4222, 'hard_credit'],
+  [429, 4011, 'rate_limit'], [401, 1001, 'auth_expired'],
+]) for (const route of ['/v1/messages', '/v1/responses']) {
+  test(`streaming worker error mapping ${route} ${status}/${upstreamCode}`, async () => {
+    const w = worker();
+    w.run(`token='local-test';models=[{key:'test',name:'Test'}];
+      refreshCredential=async()=>({token:'fixture'});
+      globalThis.fixtureError=Object.assign(Error('raw upstream fixture ${upstreamCode}'),{status:${status},upstreamCode:${upstreamCode}});
+      streamChat=async function*(){
+        yield{choices:[{delta:{content:'hi'}}],usage:{prompt_tokens:123,completion_tokens:45,total_tokens:168}};
+        throw fixtureError;
+      };`);
+    const expected = w.run('errorBodyOf(fixtureError).error');
+    assert.equal(expected.type, type);
+    assert.match(expected.message, /[\u4e00-\u9fff]/);
+    const res = await request(w, route, {
+      model: 'test', messages: [{ role: 'user', content: 'Hi' }], input: 'Hi', stream: true,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.writableEnded, true);
+    const events = res.text.split('\n').filter(line => line.startsWith('data: '))
+      .map(line => JSON.parse(line.slice(6)));
+    const failures = events.filter(e => e.type === 'error' || e.type === 'response.failed');
+    assert.equal(failures.length, 1);
+    assert.equal(events.at(-1), failures[0]);
+    assert.equal(events.some(e => ['message_stop', 'message_delta', 'response.completed', 'response.incomplete'].includes(e.type)), false);
+    const error = route.endsWith('messages') ? failures[0].error : failures[0].response.error;
+    assert.equal(error.message, expected.message);
+    assert.equal(error.code, expected.type);
+    assert.equal(res.text.includes(w.run('fixtureError.message')), false);
+    if (route.endsWith('responses')) {
+      assert.equal(failures[0].response.status, 'failed');
+      assert.equal(failures[0].response.usage.input_tokens, 123);
+      assert.equal(failures[0].response.usage.output_tokens, 45);
+    }
+    const stats = Object.values(JSON.parse(fs.readFileSync(path.join(w.dir, 'usage.json'))).days)[0].models.test;
+    assert.equal(stats.in, 123);
+    assert.equal(stats.out, 45);
+  });
+}
 
 test('failed atomic rename preserves usage and state files', () => {
   const w = worker({ fs: { renameSync() { throw Object.assign(Error('busy'), {code:'EBUSY'}); } } });

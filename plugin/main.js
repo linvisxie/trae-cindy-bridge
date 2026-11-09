@@ -119,6 +119,7 @@ function statusLines(st) {
     lines.push('Trae 桥：未登录。');
     lines.push(hintFor(st));
   }
+  if (st.updateResult?.message) lines.push(`更新结果：${st.updateResult.message}`);
   return lines;
 }
 

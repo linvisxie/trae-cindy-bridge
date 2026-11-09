@@ -12,7 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const PORT = Number(process.env.FEATURES_PORT || 47981);
-const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'worker.cjs');
+const WORKER = path.join(__dirname, '..', 'plugin', 'node', 'bootstrap.cjs');
 
 let pass = 0;
 let fail = 0;
@@ -251,7 +251,7 @@ function readState(dataDir) {
   }
 
   // 上游错误帧的人工化映射：直接按 worker 的映射表校对（同一份规则文件里）
-  const src = fs.readFileSync(WORKER, 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'plugin', 'node', 'worker.cjs'), 'utf8');
   ok('映射表覆盖登录失效', /Trae 不认当前凭证了/.test(src));
   ok('映射表覆盖额度耗尽', /额度耗尽|SOLO 额度/.test(src));
   ok('映射表覆盖限流', /限流/.test(src));

@@ -41,6 +41,10 @@ Cindy 的三个 harness 引擎（`pi` / `claude-code` / `codex`）都能接。
 
 面板只读 Trae 自己的接口和你本机的账本，**不会**替你自动签到，签到那一下永远要你自己点。
 
+## 0.1.13 发行准备（2026-11-11）
+
+本版纳入此前未发布的共享更新硬化、双锁 / journal 恢复及协议审查修复，与 [Qoder 桥](https://github.com/linvisxie/cindy-qoder-bridge) 0.1.21 配套准备。公开发行状态以 GitHub Releases 为准，发布不等于本机安装。**不包含 Qoder 专有凭据功能，也不借用 Qoder 的真实凭据验收作为 Trae 测试结果。** 详情见 [更新日志](CHANGELOG.md)。
+
 ## 工作原理
 
 ```
@@ -432,13 +436,13 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 ## 更新安全与运行边界
 
 - 更新必须提供合法的 **64 位十六进制 SHA-256** 并匹配包内容，不再降级成仅比较 size。下载仅接受本仓库指定 repo / tag / asset 的 GitHub HTTPS 地址；重定向逐跳检查允许域名，最多 5 跳，包上限 32 MiB。
-- 安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/install.log`，不保证自动重试。
+- 安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/attempt-*/install.log`，不保证自动重试。
 - 持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查这里的 journal，与 `DATA_DIR` 无关，换数据目录不能绕过，rollback 也不覆盖它。
 - **中断恢复需手动处理 journal，原生导入不会自动解除阻断。** Cindy 原生导入完整 `.cindy` 包不会清除安装目录同级的 journal。中断 copy / rollback 失败后，保留所有日志与 backup；通过 Cindy 原生导入完整包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` **重命名保留诊断**，再启用插件。不要删除备份和日志。
 - **自更新成功仅表示插件运行文件替换成功，不代表 Cindy 的宿主安装记录已刷新。** 不再自动同步宿主安装快照，也不直接写 `ghost-install-state` 安装收据或通过 `process.execPath` 执行同步脚本。Cindy 0.1.128 尚无已验证的公开插件自写收据 API；请通过 **Cindy 插件页原生导入完整 `.cindy` 包**刷新安装记录。
 - 清单 `node.entry` 为 `node/bootstrap.cjs`：先按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，之后才加载全部业务模块 / worker。Windows 使用命名管道，Linux abstract socket 仅用于 offline CI，不代表支持 Linux 运行插件。**同一安装目录即使数据目录不同也拒绝同时运行；不同端口也不能共享数据目录。多实例的安装目录和数据目录必须都不同。**
 - 适配器流中错误使用 worker 的 `formatError` 中文分类，保留已获 usage，并按失败终止，不伪装成正常完成。
-- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；这不等于本轮改动已发布或安装。本轮 Windows 故障验证使用真实临时目录，**不是真实插件安装验证**；没有真实用户登录 / 退出测试。测试通过不代表无 bug，也不扩大原有权限。
+- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；公开发行状态以 GitHub Releases 为准，发布不等于本机安装。本轮 Windows 故障验证使用真实临时目录，**不是真实插件安装验证**；没有真实用户登录 / 退出测试。测试通过不代表无 bug，也不扩大原有权限。
 
 ## 运行数据在哪
 
@@ -449,7 +453,7 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 | `%APPDATA%\CindyGlobal\trae-bridge\models.json` | 模型目录缓存（30 分钟） |
 | `%APPDATA%\CindyGlobal\trae-bridge\usage.json` | 本地用量账本（按天按模型，留 60 天，原子写） |
 | `%APPDATA%\CindyGlobal\trae-bridge\images\` | `trae_draw_image` 生成的图片 |
-| `<安装目录>.updates/`（`UPDATE_DIR`） | 安装目录同级的持久更新 journal、`latest-attempt.json`、`install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
+| `<安装目录>.updates/`（`UPDATE_DIR`） | 安装目录同级的持久更新 journal、`latest-attempt.json`、`attempt-*/install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
 | `%APPDATA%\CindyGlobal\trae-bridge\bridge.log` | 运行日志，带 ISO 时间戳，超 2 MB 自动滚成 `.1` |
 
 **你的 Trae token 不会被写进这些文件** —— 每次都是现从 Trae 客户端目录里的 `storage.json` 解密，只在内存里用。
@@ -495,7 +499,7 @@ node test\features.js
 想换模型：`node test\smoke-protocols.js <模型 id>`（默认 `deepseek-v4.1-flash`）。
 隔离测试使用临时安装副本、临时数据目录与独立端口，不与正在运行的实例共享安装目录或数据目录。`test/bootstrap.js` 登记为 offline，验证双锁取得前不加载业务模块 / worker，以及目录冲突拒绝启动；不需要登录态或真实安装，也不代表真实插件安装验证。
 
-本轮新增 `test/protocol-defaults-reasoning.js`；代码完成，待最终验证，尚未发布 / 安装。测试结果与统计以 `node .github/scripts/ci-run.cjs --mode offline` 及上述单项命令的实际输出为准，不固定断言数；未运行 / SKIP 不等于通过。
+0.1.13 纳入 `test/protocol-defaults-reasoning.js` 及上一轮共享硬化 / 协议修复；公开发行状态以 GitHub Releases 为准，发布不等于本机安装。本版不新增 Trae 真实登录 / 退出验收结论。测试结果与统计以 `node .github/scripts/ci-run.cjs --mode offline` 及上述单项命令的实际输出为准，不固定断言数；未运行 / SKIP 不等于通过。
 
 ### CI 跑哪些、哪些只能在本地跑
 
@@ -569,7 +573,7 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 - **Cindy 详情页的「报价」修不掉**。自定义供应商的模型解析器不读 `displayPricing` / `currency` / `cost` 任何字段，所以那句「该路由没有报价数据」删不掉；倍率只能写在模型名里和面板上。
 - **依赖 Trae 的内部接口**。上游一改，插件就失效。这不是「长期稳定」的东西。
 - **凭据格式一改就挂**。自有 AES 封装是逆向出来的，Trae 换加密方式（或者换 salt）之后必须先更新插件才能用。
-- **本轮协议兼容性行为变更（代码完成，待最终验证，尚未发布 / 安装）**：旧 issue #7（stream 默认值）与 #12（Responses reasoning）同属本轮剩余问题范围，不再暂缓。三协议仅在 `stream === true` 时返回 SSE；缺省或 `false` 返回单个 JSON。上游仍可使用 `stream: true` 再聚合。Responses 流式 / 非流式提供含 `summary_text` 的 reasoning item；流式使用标准 `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` 事件，只传递真实上游推理内容与 usage，不虚构。依赖旧默认流式行为的调用方需显式传 `stream: true`；尚不能将本轮行为视为已安装版本的能力。
+- **0.1.13 协议兼容性行为变更（公开发行状态以 GitHub Releases 为准，发布不等于本机安装）**：旧 issue #7（stream 默认值）与 #12（Responses reasoning）同属本轮剩余问题范围，不再暂缓。三协议仅在 `stream === true` 时返回 SSE；缺省或 `false` 返回单个 JSON。上游仍可使用 `stream: true` 再聚合。Responses 流式 / 非流式提供含 `summary_text` 的 reasoning item；流式使用标准 `response.reasoning_summary_part.*` / `response.reasoning_summary_text.*` 事件，只传递真实上游推理内容与 usage，不虚构。依赖旧默认流式行为的调用方需显式传 `stream: true`；本机可用行为以实际安装版本为准。
 
 ## 免责声明
 

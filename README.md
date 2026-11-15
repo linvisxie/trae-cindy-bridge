@@ -41,6 +41,10 @@ Cindy 的三个 harness 引擎（`pi` / `claude-code` / `codex`）都能接。
 
 面板只读 Trae 自己的接口和你本机的账本，**不会**替你自动签到，签到那一下永远要你自己点。
 
+## 0.1.14 原生更新修复（2026-11-15）
+
+旧实现的 `spawn` 事件只表示请求进程启动，不等于安装成功：Qoder 现场留下四份解包，运行版本仍为 0.1.20；Trae 仍为 0.1.12。现有证据不能断言是宿主杀死 detached 进程。新版改走 Cindy 原生安装确认，直到新 worker 运行版本达到目标才显示安装完成，随后再次检查 GitHub latest 判断是否已最新。本轮不发起模型请求；此范围不适用于历史测试。本节不声明本轮已 live 验收、已发布或已安装，完成后的最终回执另行记录。另见独立的 [Qoder 桥](https://github.com/linvisxie/cindy-qoder-bridge) 0.1.22，不借用其凭据验收结论。
+
 ## 0.1.13 发行准备（2026-11-11）
 
 本版纳入此前未发布的共享更新硬化、双锁 / journal 恢复及协议审查修复，与 [Qoder 桥](https://github.com/linvisxie/cindy-qoder-bridge) 0.1.21 配套准备。公开发行状态以 GitHub Releases 为准，发布不等于本机安装。**不包含 Qoder 专有凭据功能，也不借用 Qoder 的真实凭据验收作为 Trae 测试结果。** 详情见 [更新日志](CHANGELOG.md)。
@@ -174,7 +178,7 @@ GET  <签名 URL>                              裸 GET，不带任何 Trae 头
 
 ### 自查更新
 
-面板「检查更新」按钮 / 工具 `trae_update` 读取 GitHub Releases，比对版本，验证下载包后暂存，再交给 detached PowerShell 安装器。安装器必须等旧 worker 退出后才备份、覆盖；旧进程未退出就停止。不能依赖固定重启时间或假设覆盖一定成功，故障与宿主记录处理见下文「更新安全与运行边界」。
+面板「检查更新」按钮 / 工具 `trae_update` 读取 GitHub latest，比对版本，严格验证下载包后通过实际同一 `Cindy.exe` 的公开 `.cindy` 文件打开契约交给宿主原生安装确认。确认后由宿主完成文件安装、安装登记与插件重启；不再使用 detached PowerShell 复制安装目录，也不主动退出 worker。安装完成以新 worker 运行版本达到目标为准，之后再次检查 latest 才判断已最新；取消可重试，错误明确提示。无需手工寻找已下载文件，但保留安全确认，不承诺静默安装。
 
 ### 额度与签到
 
@@ -211,13 +215,14 @@ GET  <签名 URL>                              裸 GET，不带任何 Trae 头
 | `plugin/node/worker.cjs` | Node 常驻进程：起 HTTP 服务、三条协议路由、端口咬死、用量账本 |
 | `plugin/node/trae.cjs` | Trae 上游客户端：解密登录态、请求头、请求体整形、SSE 解码、模型目录、额度签到 |
 | `plugin/node/adapters.cjs` | Anthropic / Responses 与 OpenAI Chat 之间的协议翻译 |
-| `plugin/node/update.cjs` | 自更新纯函数：版本比较、digest 校验、zip 解包、脚本生成 |
+| `plugin/node/native-update.cjs` | 生产原生更新：校验包、定位实际同一 Cindy.exe，通过公开 `.cindy` 文件打开契约交给宿主确认安装 |
+| `plugin/node/update.cjs` | 共用版本 / digest / ZIP 校验辅助；旧脚本生成仅供旧回归与恢复，不再用于生产安装路径 |
 | `plugin/node/download.cjs` | 限制更新下载地址、重定向与包大小 |
 | `plugin/node/ownership.cjs` | 安装目录与运行数据目录的 OS 独占所有权 |
-| `plugin/node/update-status.cjs` | 更新 journal attempt / result 与中断恢复启动检查 |
+| `plugin/node/update-status.cjs` | 旧版本遗留 journal attempt / result 与中断恢复启动检查；新原生更新不写此 journal |
 | `plugin/panel.*` | 右侧栏面板：账号、额度、签到、模型列表、Base URL / Token |
 
-它只管理自身插件文件与运行数据，**不直接修改 Cindy 的宿主安装收据或供应商配置**。供应商仍需在 Cindy 界面手动添加；自更新与宿主安装记录的区别见下文。
+它只管理自身插件文件与运行数据，**不直接修改 Cindy 的宿主安装收据或供应商配置**。供应商仍需在 Cindy 界面手动添加；原生更新由宿主一次完成文件安装、安装登记和插件重启，见下文。
 
 ## 环境依赖（请逐条核对）
 
@@ -295,7 +300,7 @@ Cindy → 插件页 → 导入 `.cindy`（也可以直接把文件拖进去）�
 1. Trae 登录过期 → 在 Trae CN 客户端重新登录，然后点面板上的「刷新」。
 2. 卸载重装插件 → 供应商要重新填一次。
 3. `47822` 被**别的软件**占了 → 才需要改端口（见下面「端口为什么咬死」）。
-4. 自更新替换运行文件后 → 用 Cindy 原生导入完整 `.cindy` 包刷新宿主安装记录。
+4. 更新时 → 在自动打开的 Cindy 原生安装界面确认；无需手工寻找已下载文件或另行导入刷新记录。
 
 ## 模型列表
 
@@ -403,7 +408,7 @@ kimi-k2.6
 - **运行时长**：worker 活了多久
 - **本地用量**：今天本地打了多少请求、多少 token（`usage.json`，按天按模型记账，留 60 天）
 - **Base URL / Token**：各一个复制按钮，Token 默认打码，点「显示」才露出来
-- **检查更新**：查 GitHub Releases 有没有新版；有的话按钮变成「安装」，点一下由后台脚本替换
+- **检查更新**：查询 GitHub latest；有新版再点「安装」，校验后自动打开宿主原生安装确认；新 worker 版本达到目标才显示安装完成，随后再次检查 latest 比较才显示已最新
 - **日志文件**：`bridge.log` 的完整路径，出问题先看它
 
 AI 侧也能问：`trae_status`、`trae_endpoint`、`trae_refresh`、`trae_checkin`、`trae_draw_image`、`trae_update` 六个工具。
@@ -435,14 +440,14 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 
 ## 更新安全与运行边界
 
-- 更新必须提供合法的 **64 位十六进制 SHA-256** 并匹配包内容，不再降级成仅比较 size。下载仅接受本仓库指定 repo / tag / asset 的 GitHub HTTPS 地址；重定向逐跳检查允许域名，最多 5 跳，包上限 32 MiB。
-- 安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/attempt-*/install.log`，不保证自动重试。
-- 持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查这里的 journal，与 `DATA_DIR` 无关，换数据目录不能绕过，rollback 也不覆盖它。
-- **中断恢复需手动处理 journal，原生导入不会自动解除阻断。** Cindy 原生导入完整 `.cindy` 包不会清除安装目录同级的 journal。中断 copy / rollback 失败后，保留所有日志与 backup；通过 Cindy 原生导入完整包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` **重命名保留诊断**，再启用插件。不要删除备份和日志。
-- **自更新成功仅表示插件运行文件替换成功，不代表 Cindy 的宿主安装记录已刷新。** 不再自动同步宿主安装快照，也不直接写 `ghost-install-state` 安装收据或通过 `process.execPath` 执行同步脚本。Cindy 0.1.128 尚无已验证的公开插件自写收据 API；请通过 **Cindy 插件页原生导入完整 `.cindy` 包**刷新安装记录。
+- 更新必须提供合法的 **64 位十六进制 SHA-256** 并匹配包内容，不再降级成仅比较 size。下载仅接受本仓库指定 repo / tag / asset 的 GitHub HTTPS 地址；重定向逐跳检查允许域名，最多 5 跳，包上限 32 MiB；同时严格校验 ZIP 内插件身份和目标版本。
+- **旧版本遗留安装器（仅旧回归 / 恢复，非生产路径）**：安装器等待旧 PID 退出；未退出就停止，不覆盖文件。退出后同样按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，并在安装全过程持有双锁。取得双锁后，安装器校验 `latest-attempt.json` 的 attempt 身份；迟到脚本发现指针换代或不存在即拒绝复制。每次更新持久化 journal attempt / result；复制失败尝试回滚，回滚不覆盖 journal，失败保留诊断和 backup。`update-status` 检测到中断的 copy / rollback 会禁止 boot；journal `begin` 与 `applyUpdate` 均禁止覆盖尚未恢复的 attempt 指针，`begin` 拒绝 previous `handed_off`。pending handoff 未确认结果时不能发起新更新，应先检查 `<安装目录>.updates/attempt-*/install.log`，不保证自动重试。
+- **旧版本遗留 journal（新原生更新不写入）**：持久更新目录统一为 `UPDATE_DIR = canonicalDirectory(INSTALL_DIR) + '.updates'`，即规范化安装目录同级的 `<安装目录>.updates`，不再使用数据目录的 `update/`。bootstrap、worker 与安装器都检查这里的 journal，与 `DATA_DIR` 无关，换数据目录不能绕过，rollback 也不覆盖它。
+- **旧版本遗留中断恢复：需手动处理 journal，原生导入不会自动解除阻断。** Cindy 原生导入完整 `.cindy` 包不会清除安装目录同级的 journal。中断 copy / rollback 失败后，保留所有日志与 backup；通过 Cindy 原生导入完整包并确认成功后，停用插件，将 `<安装目录>.updates/latest-attempt.json` **重命名保留诊断**，再启用插件。不要删除备份和日志。
+- **生产更新统一交给 Cindy 原生安装**：Windows 使用实际运行的同一 `Cindy.exe` 的公开 `.cindy` 文件打开契约，自动递交已校验包并保留宿主安全确认。确认后宿主一次完成文件安装、安装登记与插件重启。插件不直接写 receipt / trust，不复制安装目录，不主动退出 worker，也不启动 PowerShell 后台 copy；打开请求成功不等于安装完成。
 - 清单 `node.entry` 为 `node/bootstrap.cjs`：先按 `INSTALL_DIR`（`install`）→ `DATA_DIR`（`data`）固定顺序取得 OS 独占锁，之后才加载全部业务模块 / worker。Windows 使用命名管道，Linux abstract socket 仅用于 offline CI，不代表支持 Linux 运行插件。**同一安装目录即使数据目录不同也拒绝同时运行；不同端口也不能共享数据目录。多实例的安装目录和数据目录必须都不同。**
 - 适配器流中错误使用 worker 的 `formatError` 中文分类，保留已获 usage，并按失败终止，不伪装成正常完成。
-- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；公开发行状态以 GitHub Releases 为准，发布不等于本机安装。本轮 Windows 故障验证使用真实临时目录，**不是真实插件安装验证**；没有真实用户登录 / 退出测试。测试通过不代表无 bug，也不扩大原有权限。
+- Cindy 0.1.128 通过 `require` 加载 Node entry，已验证与 bootstrap 兼容；公开发行状态以 GitHub Releases 为准，发布不等于本机安装。历史 Windows 故障验证使用真实临时目录，**不是真实插件安装验证**；没有真实用户登录 / 退出测试。测试通过不代表无 bug，也不扩大原有权限。
 
 ## 运行数据在哪
 
@@ -453,7 +458,7 @@ Trae 的失败方式是**把错误塞进 HTTP 200 的 SSE body 里**（`event: e
 | `%APPDATA%\CindyGlobal\trae-bridge\models.json` | 模型目录缓存（30 分钟） |
 | `%APPDATA%\CindyGlobal\trae-bridge\usage.json` | 本地用量账本（按天按模型，留 60 天，原子写） |
 | `%APPDATA%\CindyGlobal\trae-bridge\images\` | `trae_draw_image` 生成的图片 |
-| `<安装目录>.updates/`（`UPDATE_DIR`） | 安装目录同级的持久更新 journal、`latest-attempt.json`、`attempt-*/install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
+| `<安装目录>.updates/`（`UPDATE_DIR`） | 旧版本遗留（新原生更新不写此 journal）：安装目录同级的持久更新 journal、`latest-attempt.json`、`attempt-*/install.log`、下载包、暂存目录与替换脚本；与数据目录无关 |
 | `%APPDATA%\CindyGlobal\trae-bridge\bridge.log` | 运行日志，带 ISO 时间戳，超 2 MB 自动滚成 `.1` |
 
 **你的 Trae token 不会被写进这些文件** —— 每次都是现从 Trae 客户端目录里的 `storage.json` 解密，只在内存里用。
@@ -569,7 +574,7 @@ node .github\scripts\ci-run.cjs --mode offline   :: 与 GitHub Actions 同一份
 - **文生图只支持「从零生成」**。改图（把参考图一起发上去）要先经 `get_resource_upload_url` 预签名上传到 TOS，是另一条流水线，没接。
 - **没有账号池**。一个进程只用当前那一个登录态，不支持多号轮换 / 额度聚合。
 - **没有上下文档位切换**。窗口报的是实测可用上限（见上文表格），Cindy 侧不能按 128k / 200k / 1M 选档位裁剪请求 —— 窗口给多少就用多少。
-- **自动更新不是「静默」的**。要么点面板上的「检查更新」，要么让 AI 调 `trae_update`。没有做「启动时自动查、有新版自动装」—— 那意味着在你不知道的时候重启一次插件，而且中途断电可能留半个目录。
+- **自动更新不是「静默」的**。要么点面板上的「检查更新」，要么让 AI 调 `trae_update`。没有做「启动时自动查、有新版自动装」；更新仍需 Cindy 原生安全确认，不承诺无需确认的 silent install。
 - **Cindy 详情页的「报价」修不掉**。自定义供应商的模型解析器不读 `displayPricing` / `currency` / `cost` 任何字段，所以那句「该路由没有报价数据」删不掉；倍率只能写在模型名里和面板上。
 - **依赖 Trae 的内部接口**。上游一改，插件就失效。这不是「长期稳定」的东西。
 - **凭据格式一改就挂**。自有 AES 封装是逆向出来的，Trae 换加密方式（或者换 salt）之后必须先更新插件才能用。

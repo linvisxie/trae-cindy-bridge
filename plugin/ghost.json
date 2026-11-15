@@ -2,8 +2,8 @@
   "schemaVersion": 3,
   "id": "trae-bridge",
   "name": "Trae 桥",
-  "version": "0.1.13",
-  "releaseNotes": "0.1.13（2026-11-11）：纳入上一轮共享硬化与协议审查修复。三协议仅 stream === true 返回 SSE，缺省或 false 返回 JSON；Responses 保留真实 reasoning，流中错误统一分类并保留 usage。更新下载严格校验 SHA-256、GitHub 地址、重定向与大小；bootstrap 与安装器按 install→data 顺序持有双锁；安装目录同级 journal 记录结果并阻止未恢复更新，迟到安装器不得覆盖新 attempt。不再自动写 Cindy 宿主收据，须原生导入完整包刷新；中断恢复还需保留诊断并手动重命名 journal 指针。本版不包含 Qoder 专有凭据功能或其真实凭据验收结论。公开发行状态以 GitHub Releases 为准，发布不等于本机安装。",
+  "version": "0.1.14",
+  "releaseNotes": "0.1.14（2026-11-15）：修复将请求进程启动误当安装成功的问题；旧 spawn 事件不证明安装完成，也不能据此断言宿主杀死 detached 进程。保留 SHA-256、下载域名、大小及 ZIP 插件身份和目标版本严格校验。Windows 通过实际同一 Cindy.exe 的公开 .cindy 文件打开契约自动递交下载包，保留宿主原生安装安全确认；确认后宿主一次完成文件安装、安装登记与插件重启，无需手工寻找下载包或再次导入刷新记录。不自写收据或信任记录，不复制安装目录，不主动退出 worker 或使用 PowerShell 后台复制。仅新 worker 运行版本达到目标才显示安装完成，之后再次检查 GitHub 最新版比较才显示已最新；取消可重试，错误明确。新增 native-update.cjs；update.cjs 旧脚本仅供旧回归与恢复，不再用于生产安装。旧 journal 恢复说明保留，新原生更新不写此旧 journal。本轮不发起模型请求，不代表历史测试均无模型请求；不声明本轮已通过真实安装验收、已发布或已安装，最终完成回执另行记录。不包含 Qoder 专有凭据验收结论，两插件保持独立。",
   "minCindyVersion": "0.1.119",
   "author": "linvis",
   "description": "读取本机 Trae CN 客户端的登录状态，在本机 127.0.0.1:47822 起一个本地端点，同时支持三套协议：OpenAI Chat Completions、OpenAI Responses、Anthropic Messages，另带文生图。Cindy 的「自定义供应商」选任一协议都能直接指向它，模型 ID、实测上下文窗口、倍率都由插件自己公布。不修改 Cindy 任何文件，也不会替你填供应商配置。",
@@ -76,7 +76,7 @@
     },
     {
       "name": "trae_update",
-      "description": "检查并安装 Trae 桥自身的新版本（从 GitHub Releases 拉最新 .cindy）。action=check 只查有没有新版；action=apply 会下载并交给后台脚本替换，本进程随后退出，Cindy 约 20~30 秒后用新版重新拉起 worker。用户问「插件有没有新版」「更新一下 Trae 桥」时调用。",
+      "description": "检查并安装 Trae 桥自身的新版本（从 GitHub Releases 拉最新 .cindy）。action=check 只查有没有新版；action=apply 下载并自动打开 Cindy 原生安装确认，确认后由宿主完成文件安装、安装登记与插件重启；新 worker 运行版本达到目标才算安装完成，不承诺固定重启时间或无需确认的静默安装。用户问「插件有没有新版」「更新一下 Trae 桥」时调用。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -86,7 +86,7 @@
               "check",
               "apply"
             ],
-            "description": "check=只检查（默认），apply=下载并安装。"
+            "description": "check=只检查（默认）；apply=下载并打开 Cindy 原生安装确认，不绕过安全确认。"
           }
         },
         "additionalProperties": false
